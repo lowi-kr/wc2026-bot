@@ -63,7 +63,7 @@ export default {
     }
 
     return new Response(
-      "⚽ WC2026 Bot running.\n\n" +
+      " WC2026 Bot running.\n\n" +
       "Manual triggers (GET):\n" +
       "  ?action=init                  — One-time: load group stage fixtures + post schedule\n" +
       "  ?action=daily                 — Run daily job now (post tomorrow's schedule)\n" +

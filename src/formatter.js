@@ -15,7 +15,7 @@ const ET_TIMEZONE = "America/New_York";
 // ─── Schedule Posts ───────────────────────────────────────────────────────────
 
 export function formatGroupStageSchedule(fixtures, filtered, countries) {
-  const lines = ["🏆 FIFA World Cup 2026 — Group Stage Schedule\n"];
+  const lines = [" FIFA World Cup 2026 — Group Stage Schedule\n"];
 
   if (filtered) {
     lines.push(`👀 Tracking: ${countries.join(", ")}\n`);
@@ -28,10 +28,10 @@ export function formatGroupStageSchedule(fixtures, filtered, countries) {
 
   const byDate = groupByDate(fixtures);
   for (const date of Object.keys(byDate).sort()) {
-    lines.push(`📅 ${readableDate(date)}`);
+    lines.push(` ${readableDate(date)}`);
     for (const f of byDate[date]) {
-      lines.push(`  ⚽ ${f.home} vs ${f.away}`);
-      lines.push(`     🕐 ${kickoffET(f.kickoff_utc)} | ${f.round}`);
+      lines.push(`   ${f.home} vs ${f.away}`);
+      lines.push(`      ${kickoffET(f.kickoff_utc)} | ${f.round}`);
     }
     lines.push("");
   }
@@ -41,13 +41,13 @@ export function formatGroupStageSchedule(fixtures, filtered, countries) {
 
 export function formatDailySchedule(fixtures, dateLabel) {
   if (!fixtures || fixtures.length === 0) {
-    return `📅 ${dateLabel}: No World Cup 2026 matches scheduled.`;
+    return ` ${dateLabel}: No World Cup 2026 matches scheduled.`;
   }
 
-  const lines = [`🏆 FIFA World Cup 2026\n📅 ${dateLabel}\n`];
+  const lines = [` FIFA World Cup 2026\n ${dateLabel}\n`];
   for (const f of fixtures) {
-    lines.push(`⚽ ${f.home} vs ${f.away}`);
-    lines.push(`   🕐 ${kickoffET(f.kickoff_utc)} | ${f.round}\n`);
+    lines.push(` ${f.home} vs ${f.away}`);
+    lines.push(`    ${kickoffET(f.kickoff_utc)} | ${f.round}\n`);
   }
   return lines.join("\n").trimEnd();
 }
@@ -56,16 +56,16 @@ export function formatDailySchedule(fixtures, dateLabel) {
 
 export function formatKickoff(fixture) {
   return (
-    `🚨 KICK OFF!\n` +
-    `🏆 ${fixture.round}\n` +
-    `⚽ ${fixture.home} vs ${fixture.away}\n` +
-    `🕐 ${kickoffET(fixture.kickoff_utc)}`
+    ` KICK OFF!\n` +
+    ` ${fixture.round}\n` +
+    ` ${fixture.home} vs ${fixture.away}\n` +
+    ` ${kickoffET(fixture.kickoff_utc)}`
   );
 }
 
 export function formatHalfTime(fixture, homeScore, awayScore) {
   return (
-    `🔔 HALF TIME\n` +
+    ` HALF TIME\n` +
     `${fixture.home} ${homeScore}–${awayScore} ${fixture.away}`
   );
 }
@@ -77,13 +77,13 @@ export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort
     "FULL TIME";
 
   const winner =
-    homeScore > awayScore ? `🏆 ${fixture.home} win!` :
-    awayScore > homeScore ? `🏆 ${fixture.away} win!` :
-    "🤝 Draw";
+    homeScore > awayScore ? ` ${fixture.home} win!` :
+    awayScore > homeScore ? ` ${fixture.away} win!` :
+    " Draw";
 
   let msg =
-    `🏁 ${label}\n` +
-    `🏆 ${fixture.round}\n` +
+    ` ${label}\n` +
+    ` ${fixture.round}\n` +
     `${fixture.home} ${homeScore}–${awayScore} ${fixture.away}\n` +
     `${winner}`;
 
@@ -98,7 +98,7 @@ export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort
     const a = stats.find((t) => t.homeAway === "away") || stats[1];
 
     msg +=
-      `\n\n📊 Match Stats\n` +
+      `\n\n Match Stats\n` +
       `Possession:  ${getStat(h, "possessionPct")} — ${getStat(a, "possessionPct")}\n` +
       `Shots:       ${getStat(h, "totalShots")} — ${getStat(a, "totalShots")}\n` +
       `On Target:   ${getStat(h, "shotsOnTarget")} — ${getStat(a, "shotsOnTarget")}\n` +
@@ -138,35 +138,37 @@ export function formatEvent(play, fixture, homeScore, awayScore) {
     const name      = scorer || anyPlayer;
 
     if (isOG) {
-      return `😬 ${min} OWN GOAL — ${name} (${team})\n${fixture.home} ${score} ${fixture.away}`;
+      return ` ${min} OWN GOAL — ${name} (${team})\n${fixture.home} ${score} ${fixture.away}`;
     }
     if (isPenalty) {
-      return `🎯 ${min} PENALTY — ${name} (${team})\n${fixture.home} ${score} ${fixture.away}`;
+      return ` ${min} PENALTY — ${name} (${team})\n${fixture.home} ${score} ${fixture.away}`;
     }
     return (
-      `⚽ ${min} GOAL — ${name} (${team})` +
+      ` ${min} GOAL — ${name} (${team})` +
       (assist ? ` | Assist: ${assist}` : "") +
       `\n${fixture.home} ${score} ${fixture.away}`
     );
   }
 
   if (typeText.includes("yellow card")) {
-    return `🟨 ${min} YELLOW CARD — ${carded || anyPlayer} (${team})`;
+    return ` ${min} YELLOW CARD — ${carded || anyPlayer} (${team})`;
   }
 
-  if (typeText.includes("red card")) {
-    const emoji = typeText.includes("yellow") ? "🟧" : "🟥"; // second yellow vs straight red
-    return `${emoji} ${min} RED CARD — ${carded || anyPlayer} (${team})`;
+  /**
+  *if (typeText.includes("red card")) {
+  *  const emoji = typeText.includes("yellow") ? "" : ""; // second yellow vs straight red
+  * return `${emoji} ${min} RED CARD — ${carded || anyPlayer} (${team})`;
   }
+  */
 
   if (typeText.includes("substitution")) {
     const on  = subOn  || anyPlayer;
     const off = subOff || "?";
-    return `🔄 ${min} SUB — ${on} ▶️ IN  /  ${off} ◀️ OUT  (${team})`;
+    return ` ${min} SUB — ${on}  IN  /  ${off}  OUT  (${team})`;
   }
 
   if (typeText.includes("var")) {
-    return `📺 ${min} VAR — ${play.text || typeText} (${team})`;
+    return ` ${min} VAR — ${play.text || typeText} (${team})`;
   }
 
   return null;
