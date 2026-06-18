@@ -1,18 +1,19 @@
 /**
  * formatter.js — Format all GroupMe messages
  * All times displayed in US Eastern (ET).
+ *
+ * ESPN play objects have a different shape than API-Football:
+ *   play.type.text       — e.g. "Goal", "Yellow Card", "Substitution"
+ *   play.clock.displayValue — e.g. "45'"
+ *   play.participants[]  — array of { athlete: { displayName, id }, type: { text } }
+ *   play.team.displayName
+ *   play.text            — human-readable description ESPN generates (e.g. "Mbappé scores")
  */
 
 const ET_TIMEZONE = "America/New_York";
 
 // ─── Schedule Posts ───────────────────────────────────────────────────────────
 
-/**
- * Format the full group stage schedule (posted once).
- * @param {Array} fixtures - rows from D1
- * @param {boolean} filtered - whether a country filter is active
- * @param {string[]} countries - list of followed countries (for footer note)
- */
 export function formatGroupStageSchedule(fixtures, filtered, countries) {
   const lines = ["🏆 FIFA World Cup 2026 — Group Stage Schedule\n"];
 
@@ -38,11 +39,6 @@ export function formatGroupStageSchedule(fixtures, filtered, countries) {
   return lines.join("\n").trimEnd();
 }
 
-/**
- * Format tomorrow's schedule (daily knockout post).
- * @param {Array} fixtures - rows from D1
- * @param {string} dateLabel - e.g. "Tomorrow — Wednesday, July 1"
- */
 export function formatDailySchedule(fixtures, dateLabel) {
   if (!fixtures || fixtures.length === 0) {
     return `📅 ${dateLabel}: No World Cup 2026 matches scheduled.`;
@@ -76,18 +72,14 @@ export function formatHalfTime(fixture, homeScore, awayScore) {
 
 export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort) {
   const label =
-    statusShort === "AET"
-      ? "FULL TIME (AET)"
-      : statusShort === "PEN"
-      ? "FULL TIME (Penalties)"
-      : "FULL TIME";
+    statusShort === "AET" ? "FULL TIME (AET)" :
+    statusShort === "PEN" ? "FULL TIME (Penalties)" :
+    "FULL TIME";
 
   const winner =
-    homeScore > awayScore
-      ? `🏆 ${fixture.home} win!`
-      : awayScore > homeScore
-      ? `🏆 ${fixture.away} win!`
-      : "🤝 Draw";
+    homeScore > awayScore ? `🏆 ${fixture.home} win!` :
+    awayScore > homeScore ? `🏆 ${fixture.away} win!` :
+    "🤝 Draw";
 
   let msg =
     `🏁 ${label}\n` +
@@ -95,67 +87,88 @@ export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort
     `${fixture.home} ${homeScore}–${awayScore} ${fixture.away}\n` +
     `${winner}`;
 
+  // ESPN boxscore.teams returns [{team, statistics: [{name, displayValue}]}]
   if (stats && stats.length >= 2) {
-    const h = stats[0].statistics;
-    const a = stats[1].statistics;
-    const get = (arr, type) => arr.find((s) => s.type === type)?.value ?? "—";
+    const getStat = (teamStats, name) => {
+      const stats = teamStats?.statistics || [];
+      return stats.find((s) => s.name === name)?.displayValue ?? "—";
+    };
+
+    const h = stats.find((t) => t.homeAway === "home") || stats[0];
+    const a = stats.find((t) => t.homeAway === "away") || stats[1];
 
     msg +=
       `\n\n📊 Match Stats\n` +
-      `Possession:  ${get(h, "Ball Possession")} — ${get(a, "Ball Possession")}\n` +
-      `Shots:       ${get(h, "Total Shots")} — ${get(a, "Total Shots")}\n` +
-      `On Target:   ${get(h, "Shots on Goal")} — ${get(a, "Shots on Goal")}\n` +
-      `Corners:     ${get(h, "Corner Kicks")} — ${get(a, "Corner Kicks")}\n` +
-      `Fouls:       ${get(h, "Fouls")} — ${get(a, "Fouls")}`;
+      `Possession:  ${getStat(h, "possessionPct")} — ${getStat(a, "possessionPct")}\n` +
+      `Shots:       ${getStat(h, "totalShots")} — ${getStat(a, "totalShots")}\n` +
+      `On Target:   ${getStat(h, "shotsOnTarget")} — ${getStat(a, "shotsOnTarget")}\n` +
+      `Corners:     ${getStat(h, "cornerKicks")} — ${getStat(a, "cornerKicks")}\n` +
+      `Fouls:       ${getStat(h, "fouls")} — ${getStat(a, "fouls")}`;
   }
 
   return msg;
 }
 
 /**
- * Format a single match event (goal, card, sub, VAR).
- * Returns null for event types we don't want to post.
+ * Format a single ESPN play object into a GroupMe message.
+ * ESPN play shape:
+ *   play.type.text       — "Goal", "Yellow Card", "Red Card", "Substitution", "VAR"
+ *   play.clock.displayValue — "34'"
+ *   play.text            — ESPN's own description e.g. "Kylian Mbappé goal"
+ *   play.participants[]  — [{athlete: {displayName}, type: {text: "Scorer"|"Assist"|...}}]
+ *   play.team.displayName
  */
-export function formatEvent(event, fixture, homeScore, awayScore) {
-  const min =
-    event.time.elapsed + (event.time.extra ? `+${event.time.extra}` : "") + "'";
-  const team = event.team.name;
-  const player = event.player?.name || "Unknown";
-  const assist = event.assist?.name;
-  const type = event.type;
-  const detail = event.detail;
+export function formatEvent(play, fixture, homeScore, awayScore) {
+  const typeText = (play.type?.text || "").toLowerCase();
+  const min      = play.clock?.displayValue || "?'";
+  const team     = play.team?.displayName || "";
+  const score    = `${homeScore}–${awayScore}`;
 
-  if (type === "Goal") {
-    const score = `${homeScore}–${awayScore}`;
-    if (detail === "Own Goal") {
-      return `😬 ${min} OWN GOAL — ${player} (${team})\n${fixture.home} ${score} ${fixture.away}`;
+  // Find participants by role
+  const scorer  = play.participants?.find((p) => p.type?.text === "Scorer")?.athlete?.displayName;
+  const assist  = play.participants?.find((p) => p.type?.text === "Assist")?.athlete?.displayName;
+  const subOn   = play.participants?.find((p) => p.type?.text === "Entering")?.athlete?.displayName;
+  const subOff  = play.participants?.find((p) => p.type?.text === "Exiting")?.athlete?.displayName;
+  const carded  = play.participants?.find((p) => p.type?.text === "Carded")?.athlete?.displayName;
+  const anyPlayer = play.participants?.[0]?.athlete?.displayName || "Unknown";
+
+  if (typeText.includes("goal")) {
+    const isOG      = typeText.includes("own");
+    const isPenalty = typeText.includes("penalty");
+    const name      = scorer || anyPlayer;
+
+    if (isOG) {
+      return `😬 ${min} OWN GOAL — ${name} (${team})\n${fixture.home} ${score} ${fixture.away}`;
     }
-    if (detail === "Penalty") {
-      return `🎯 ${min} PENALTY — ${player} (${team})\n${fixture.home} ${score} ${fixture.away}`;
+    if (isPenalty) {
+      return `🎯 ${min} PENALTY — ${name} (${team})\n${fixture.home} ${score} ${fixture.away}`;
     }
     return (
-      `⚽ ${min} GOAL — ${player} (${team})` +
+      `⚽ ${min} GOAL — ${name} (${team})` +
       (assist ? ` | Assist: ${assist}` : "") +
       `\n${fixture.home} ${score} ${fixture.away}`
     );
   }
 
-  if (type === "Card") {
-    const emoji =
-      detail === "Red Card" ? "🟥" : detail === "Yellow Red Card" ? "🟧" : "🟨";
-    return `${emoji} ${min} ${detail.toUpperCase()} — ${player} (${team})`;
+  if (typeText.includes("yellow card")) {
+    return `🟨 ${min} YELLOW CARD — ${carded || anyPlayer} (${team})`;
   }
 
-  if (type === "subst") {
-    const off = assist || "?"; // API-Football puts the outgoing player in assist field
-    return `🔄 ${min} SUB — ${player} ▶️ IN  /  ${off} ◀️ OUT  (${team})`;
+  if (typeText.includes("red card")) {
+    const emoji = typeText.includes("yellow") ? "🟧" : "🟥"; // second yellow vs straight red
+    return `${emoji} ${min} RED CARD — ${carded || anyPlayer} (${team})`;
   }
 
-  if (type === "Var") {
-    return `📺 ${min} VAR — ${detail} | ${player} (${team})`;
+  if (typeText.includes("substitution")) {
+    const on  = subOn  || anyPlayer;
+    const off = subOff || "?";
+    return `🔄 ${min} SUB — ${on} ▶️ IN  /  ${off} ◀️ OUT  (${team})`;
   }
 
-  // Ignore anything else (e.g. "Missed Penalty" already captured as a goal event)
+  if (typeText.includes("var")) {
+    return `📺 ${min} VAR — ${play.text || typeText} (${team})`;
+  }
+
   return null;
 }
 
@@ -163,18 +176,18 @@ export function formatEvent(event, fixture, homeScore, awayScore) {
 
 function kickoffET(isoDate) {
   return new Date(isoDate).toLocaleTimeString("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: ET_TIMEZONE,
+    hour:         "2-digit",
+    minute:       "2-digit",
+    timeZone:     ET_TIMEZONE,
     timeZoneName: "short",
   });
 }
 
 function readableDate(dateStr) {
   return new Date(dateStr + "T12:00:00Z").toLocaleDateString("en-US", {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
+    weekday:  "long",
+    month:    "long",
+    day:      "numeric",
     timeZone: "UTC",
   });
 }

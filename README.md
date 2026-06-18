@@ -37,7 +37,7 @@ You'll create accounts on three free websites and connect them together. No codi
 |---------|-------------|------|
 | **GitHub** | Stores the bot's code | Free |
 | **Cloudflare** | Runs the bot 24/7 and auto-deploys when you change the code | Free |
-| **API-Football** | Provides live match data | Free (100 req/day) |
+| **ESPN** | Provides live match data (unofficial API, no key needed) | Free |
 
 Everything sensitive (API keys, bot IDs) is stored inside Cloudflare — nothing private is ever written in the code files.
 
@@ -53,12 +53,6 @@ Everything sensitive (API keys, bot IDs) is stored inside Cloudflare — nothing
 1. Go to [cloudflare.com](https://cloudflare.com) and click **Sign up**
 2. Create a free account and verify your email
 3. If it asks you to add a domain — click **Skip** or **Add later**, you don't need one
-
-### API-Football
-1. Go to [dashboard.api-football.com/register](https://dashboard.api-football.com/register)
-2. Create a free account
-3. After logging in, find your **API Key** on the dashboard home page
-4. Copy it and save it somewhere (like Notepad) — you'll need it later
 
 ---
 
@@ -156,10 +150,10 @@ This is what makes Cloudflare automatically redeploy the bot every time you chan
 | Variable name | Value | Type |
 |--------------|-------|------|
 | `D1_DATABASE_ID` | your database ID from Step 4a | Plain text |
-| `API_FOOTBALL_KEY` | your API-Football key from Step 1 | **Encrypt** |
+
 | `GROUPME_BOT_ID` | your GroupMe bot ID from Step 3 | **Encrypt** |
 
-> For `API_FOOTBALL_KEY` and `GROUPME_BOT_ID`, tick **Encrypt** before saving so they're stored securely and never shown again.
+> For `GROUPME_BOT_ID`, tick **Encrypt** before saving so it's stored securely and never shown again.
 
 9. Click **Save and Deploy**
 
@@ -203,14 +197,14 @@ This tells the bot to fetch the group stage schedule and post it to your GroupMe
 
 **The bot isn't posting anything**
 - Go to Cloudflare Dashboard → Workers & Pages → wc2026-bot → **Logs** to see errors
-- Double-check that `API_FOOTBALL_KEY` and `GROUPME_BOT_ID` were entered correctly in Step 4c
+- Double-check that `GROUPME_BOT_ID` was entered correctly in Step 4c
 
 **The deploy failed**
 - Go to your Worker page → **Deployments** tab to see the error
 - Most common cause: a variable in Step 4c is missing or has a typo
 
 **A country isn't being tracked**
-- API-Football uses `"United States"` not `"USA"` — check the Country Filter section below
+- ESPN uses `"United States"` not `"USA"` — check the Country Filter section below
 
 **I want to re-post the group stage schedule**
 - Visit `?action=init` again — it won't re-post if it already ran
@@ -241,7 +235,7 @@ The file `src/countries.js` controls which teams are tracked during the group st
 
 **To change the list:** open `src/countries.js` on GitHub, click the pencil icon to edit, update the names, and click **Commit changes**. The bot redeploys automatically within a minute.
 
-Team names must match exactly how API-Football spells them:
+Team names must match exactly how ESPN spells them:
 - ✅ `"United States"` not `"USA"`
 - ✅ `"South Korea"` not `"Korea"`
 
@@ -257,7 +251,7 @@ with your API key in the header `x-apisports-key`.
 wc2026-bot/
 ├── src/
 │   ├── index.js       # Main logic — cron jobs, live polling, match flow
-│   ├── api.js         # Fetches data from API-Football
+│   ├── api.js         # Fetches live data from ESPN's free unofficial API
 │   ├── db.js          # Reads and writes to the Cloudflare D1 database
 │   ├── formatter.js   # Turns match data into GroupMe messages
 │   ├── groupme.js     # Sends messages to GroupMe

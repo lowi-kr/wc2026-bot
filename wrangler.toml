@@ -12,12 +12,8 @@ crons = [
 [[d1_databases]]
 binding = "DB"
 database_name = "wc2026"
-database_id = "$D1_DATABASE_ID"   # Injected automatically by GitHub Actions — do not edit
+database_id = "$D1_DATABASE_ID"   # Injected by Cloudflare build variable — do not edit
 
-[vars]
-WC_LEAGUE_ID = "1"
-WC_SEASON    = "2026"
-
-# All secrets are stored in Cloudflare (never in this file):
-#   API_FOOTBALL_KEY   — set in Cloudflare Dashboard → Workers → wc2026-bot → Settings → Variables
-#   GROUPME_BOT_ID     — same place
+# No API key needed — this bot uses ESPN's free unofficial API
+# Only secret needed at runtime:
+#   GROUPME_BOT_ID — set in Cloudflare Dashboard → Workers → wc2026-bot → Settings → Variables
