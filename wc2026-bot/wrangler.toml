@@ -1,0 +1,23 @@
+name = "wc2026-bot"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = [
+  "* * * * *",   # Every minute — smart live polling (exits instantly if no active games)
+  "0 8 * * *"    # 8AM UTC daily — post tomorrow's knockout schedule
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "wc2026"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[vars]
+WC_LEAGUE_ID = "1"       # Verify this at api-football.com/documentation for WC 2026
+WC_SEASON    = "2026"
+
+# Secrets — set via `wrangler secret put`:
+#   API_FOOTBALL_KEY   your API-Football key
+#   GROUPME_BOT_ID     your GroupMe bot ID

@@ -1,0 +1,7 @@
+# Rename this file to .dev.vars for local development.
+# .dev.vars is gitignored — never commit your real keys.
+
+API_FOOTBALL_KEY=your_api_football_key_here
+GROUPME_BOT_ID=your_groupme_bot_id_here
+WC_LEAGUE_ID=1
+WC_SEASON=2026
