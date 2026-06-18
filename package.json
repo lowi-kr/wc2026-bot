@@ -1,0 +1,15 @@
+{
+  "name": "wc2026-bot",
+  "version": "1.0.0",
+  "description": "FIFA World Cup 2026 GroupMe bot powered by Cloudflare Workers",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "license": "MIT"
+}

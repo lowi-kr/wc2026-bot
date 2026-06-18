@@ -1,0 +1,27 @@
+name = "wc2026-bot"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = [
+  "* * * * *",        # Every minute — live match polling
+  "0 8 * * *"         # Every day at 8AM UTC — tomorrow's schedule
+]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_KV_PREVIEW_ID"
+
+[vars]
+# Group Stage end date (inclusive). Knockout polling starts after this.
+GROUP_STAGE_END = "2026-06-26"
+# From this date onward, daily schedule posts begin
+DAILY_SCHEDULE_START = "2026-06-27"
+# World Cup 2026 league ID on API-Football (verify at api-football.com)
+WC_LEAGUE_ID = "1"
+WC_SEASON = "2026"
+
+# Secrets (set via `wrangler secret put`):
+# API_FOOTBALL_KEY   — your API-Football key
+# GROUPME_BOT_ID     — your GroupMe bot ID
