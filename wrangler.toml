@@ -23,3 +23,7 @@ id = "$KV_NAMESPACE_ID"   # Injected by Cloudflare build variable — do not edi
 # No API key needed — this bot uses ESPN's free unofficial API
 # Only secret needed at runtime:
 #   GROUPME_BOT_ID — set in Cloudflare Dashboard → Workers → wc2026-bot → Settings → Variables
+
+[observability.logs]
+enabled = true
+invocation_logs = true
