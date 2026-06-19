@@ -33,13 +33,15 @@ export async function getFixturesByDate(db, date) {
 }
 
 /**
- * Get fixtures that are currently active:
- * kicked off in the last 130 minutes and not yet marked FT/AET/PEN.
+ * Get fixtures that are currently active: status is not yet finished.
+ * Bounded to fixtures that kicked off within the last 6 hours as a safety
+ * net, so a fixture stuck in a bad status (e.g. due to a bug or an ESPN
+ * data gap) can't get polled forever — but the bound is generous enough
+ * to comfortably cover regulation time + extra time + penalties + delays.
  */
 export async function getActiveFixtures(db) {
   const now = Date.now();
-  const windowStart = new Date(now - 130 * 60 * 1000).toISOString();
-  const windowEnd = new Date(now).toISOString();
+  const safetyBoundStart = new Date(now - 6 * 60 * 60 * 1000).toISOString();
   const { results } = await db
     .prepare(
       `SELECT * FROM fixtures
@@ -48,7 +50,7 @@ export async function getActiveFixtures(db) {
          AND status NOT IN ('FT', 'AET', 'PEN')
        ORDER BY kickoff_utc ASC`
     )
-    .bind(windowStart, windowEnd)
+    .bind(safetyBoundStart, new Date(now).toISOString())
     .all();
   return results;
 }

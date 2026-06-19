@@ -137,19 +137,27 @@ async function runHourlyCheck(env) {
     return;
   }
 
+  // The hourly check is the ONLY place that decides whether game_imminent
+  // is on or off. The minute poll never turns this flag off itself — it
+  // would risk falsely going to sleep mid-match due to a transient DB read
+  // or a status update that hadn't landed yet (race condition). Letting
+  // only the hourly check own this flag means a single bad minute-poll
+  // read can never put the bot to sleep during a live match.
+  const activeOrUpcoming = await getActiveFixtures(env.DB);
   const today    = utcDate(0);
   const fixtures = await getFixturesByDate(env.DB, today);
   const now      = Date.now();
 
-  // A game is "imminent" if it kicks off within the next 70 minutes
-  // OR if it's already in progress (kickoff was in the last 120 minutes and not FT)
-  const imminent = fixtures.some((f) => {
-    const kickoff = new Date(f.kickoff_utc).getTime();
-    const minsUntil  = (kickoff - now) / 60000;
-    const minsAgo    = (now - kickoff) / 60000;
-    const notFinished = !["FT", "AET", "PEN"].includes(f.status);
-    return (minsUntil >= 0 && minsUntil <= 70) || (minsAgo >= 0 && minsAgo <= 120 && notFinished);
+  // A game is "imminent" if it kicks off within the next 70 minutes,
+  // OR if getActiveFixtures (status-based, not time-window-based) says
+  // it's still in progress right now.
+  const upcomingSoon = fixtures.some((f) => {
+    const kickoff   = new Date(f.kickoff_utc).getTime();
+    const minsUntil = (kickoff - now) / 60000;
+    return minsUntil >= 0 && minsUntil <= 70;
   });
+
+  const imminent = upcomingSoon || activeOrUpcoming.length > 0;
 
   await env.KV.put(KV_GAME_IMMINENT, imminent ? "1" : "0", {
     expirationTtl: 60 * 60 * 2,
@@ -159,20 +167,16 @@ async function runHourlyCheck(env) {
 
 // ─── Minute Poll ──────────────────────────────────────────────────────────────
 // Runs every minute. Exits immediately if game_imminent is not set.
+// IMPORTANT: this function only ever does work — it never clears the
+// game_imminent flag itself. Only runHourlyCheck decides when to sleep.
+// This avoids a race where a single bad/early getActiveFixtures read
+// during the minute poll could prematurely put the bot to sleep mid-match.
 
 async function runMinutePoll(env) {
   const imminent = await env.KV.get(KV_GAME_IMMINENT);
   if (imminent !== "1") return; // Exit instantly — no game imminent
 
   await runLivePolling(env);
-
-  // After polling, check if all active games are now finished
-  // If so, clear the imminent flag so the minute cron goes back to sleep
-  const activeInDb = await getActiveFixtures(env.DB);
-  if (activeInDb.length === 0) {
-    await env.KV.put(KV_GAME_IMMINENT, "0", { expirationTtl: 60 * 60 * 2 });
-    console.log("All games finished — cleared game_imminent flag.");
-  }
 }
 
 // ─── Live Polling ─────────────────────────────────────────────────────────────
@@ -215,14 +219,18 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
   const awayScore = parseInt(away?.score || "0", 10);
 
   // Kickoff
+  // Status is updated BEFORE posting, not after. If postToGroupMe fails
+  // (GroupMe API down/rate-limited), we'd rather silently miss one kickoff
+  // message than spam "KICK OFF" every minute until the call succeeds.
   if (prevStatus === "NS" && state === ESPN_STATUS.IN && statusName !== "STATUS_HALFTIME") {
-    await postToGroupMe(env, formatKickoff(dbFixture));
     await updateFixtureStatus(env.DB, dbFixture.id, "LIVE");
+    await postToGroupMe(env, formatKickoff(dbFixture));
     return;
   }
 
-  // Half time
+  // Half time — same ordering rationale as kickoff above.
   if (statusName === "STATUS_HALFTIME" && prevStatus !== "HT") {
+    await updateFixtureStatus(env.DB, dbFixture.id, "HT");
     let htStats = null;
     try {
       htStats = await fetchStats(env, dbFixture.id);
@@ -230,7 +238,6 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
       console.error(`Could not fetch HT stats for ${dbFixture.id}:`, err);
     }
     await postToGroupMe(env, formatHalfTime(dbFixture, homeScore, awayScore, htStats));
-    await updateFixtureStatus(env.DB, dbFixture.id, "HT");
     return;
   }
 
@@ -239,7 +246,7 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
     await updateFixtureStatus(env.DB, dbFixture.id, "LIVE");
   }
 
-  // Full time
+  // Full time — handleMatchEnd itself updates status before posting (see below)
   if (state === ESPN_STATUS.POST && !["FT", "AET", "PEN"].includes(prevStatus)) {
     const ftStatus = deriveFullTimeStatus(statusName);
     await handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, ftStatus);
@@ -291,8 +298,11 @@ async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
     ? formatEvent(latestGoal, dbFixture, homeScore, awayScore)
     : formatGenericGoal(dbFixture, homeScore, awayScore);
 
-  if (msg) await postToGroupMe(env, msg);
+  // Record before posting — same rationale as kickoff/HT/FT: a failed
+  // postToGroupMe call should mean we silently miss one goal announcement,
+  // not that we re-announce the same goal every minute until it succeeds.
   await insertSeenEvent(env.DB, dbFixture.id, scoreKey);
+  if (msg) await postToGroupMe(env, msg);
 }
 
 async function handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, ftStatus) {
@@ -303,9 +313,11 @@ async function handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, f
     console.error(`Could not fetch stats for ${dbFixture.id}:`, err);
   }
 
+  // Status updated before posting — same rationale as kickoff/half-time:
+  // avoids spamming "FULL TIME" every minute if postToGroupMe fails once.
+  await updateFixtureStatus(env.DB, dbFixture.id, ftStatus);
   const msg = formatFullTime(dbFixture, homeScore, awayScore, stats, ftStatus);
   await postToGroupMe(env, msg);
-  await updateFixtureStatus(env.DB, dbFixture.id, ftStatus);
   console.log(`Match ended: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away} (${ftStatus})`);
 }
 
