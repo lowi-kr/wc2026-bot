@@ -5,8 +5,10 @@ compatibility_flags = ["nodejs_compat"]
 
 [triggers]
 crons = [
-  "* * * * *",   # Every minute — smart live polling (exits instantly if no active games)
-  "0 8 * * *"    # 8AM UTC daily — post tomorrow's knockout schedule
+  "0 0 * * *",   # Midnight UTC — checks D1 for games today, sets games_today flag
+  "0 8 * * *",   # 8AM UTC — post tomorrow's knockout schedule
+  "0 * * * *",   # Every hour — checks for an imminent/live game, sets game_imminent flag
+  "* * * * *"    # Every minute — only does work if game_imminent flag is set
 ]
 
 [[d1_databases]]
@@ -14,10 +16,10 @@ binding = "DB"
 database_name = "wc2026"
 database_id = "$D1_DATABASE_ID"   # Injected by Cloudflare build variable — do not edit
 
+[[kv_namespaces]]
+binding = "KV"
+id = "$KV_NAMESPACE_ID"   # Injected by Cloudflare build variable — do not edit
+
 # No API key needed — this bot uses ESPN's free unofficial API
 # Only secret needed at runtime:
 #   GROUPME_BOT_ID — set in Cloudflare Dashboard → Workers → wc2026-bot → Settings → Variables
-
-[observability.logs]
-enabled = true
-invocation_logs = true
