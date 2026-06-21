@@ -136,18 +136,68 @@ function toESPNDate(dateStr) {
   return dateStr.replace(/-/g, "");
 }
 
+const MAX_RETRIES   = 2;       // total attempts = MAX_RETRIES + 1
+const BASE_DELAY_MS = 400;     // first retry waits ~400ms, then ~800ms
+const MAX_DELAY_MS  = 3000;    // cap any single wait — cron has a tight budget
+
 /**
  * Fetch from ESPN and return parsed JSON.
  * ESPN doesn't require auth headers — plain fetch works from Workers.
+ *
+ * Retries on transient failures only:
+ *   - network errors (fetch throwing, e.g. DNS hiccup, connection reset)
+ *   - 5xx server errors
+ *   - 429 rate limiting (honors Retry-After header if ESPN sends one)
+ * Does NOT retry 4xx errors other than 429 — a 404 or bad request will
+ * never succeed on retry, so we fail fast instead of burning the cron's
+ * limited time budget (the minute-poll cron has well under 60s before
+ * the next invocation fires).
  */
 async function espnFetch(url) {
-  const res = await fetch(url, {
-    headers: {
-      // Mimic a browser to avoid any potential blocks
-      "Accept": "application/json",
-      "User-Agent": "Mozilla/5.0 (compatible; WC2026Bot/1.0)",
-    },
-  });
-  if (!res.ok) throw new Error(`ESPN API ${res.status}: ${url}`);
-  return res.json();
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: {
+          // Mimic a browser to avoid any potential blocks
+          "Accept": "application/json",
+          "User-Agent": "Mozilla/5.0 (compatible; WC2026Bot/1.0)",
+        },
+      });
+    } catch (err) {
+      // Network-level failure (fetch threw) — always retryable
+      lastErr = err;
+      if (attempt < MAX_RETRIES) {
+        await sleep(backoffDelay(attempt));
+        continue;
+      }
+      throw new Error(`ESPN fetch network error after ${attempt + 1} attempts: ${url} (${err.message})`);
+    }
+
+    if (res.ok) return res.json();
+
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable || attempt === MAX_RETRIES) {
+      throw new Error(`ESPN API ${res.status}: ${url}`);
+    }
+
+    const retryAfterHeader = res.headers.get("Retry-After");
+    const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : null;
+    const delay = retryAfterMs && !isNaN(retryAfterMs)
+      ? Math.min(retryAfterMs, MAX_DELAY_MS)
+      : backoffDelay(attempt);
+
+    lastErr = new Error(`ESPN API ${res.status}: ${url}`);
+    await sleep(delay);
+  }
+  throw lastErr;
 }
+
+function backoffDelay(attempt) {
+  return Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+      }
