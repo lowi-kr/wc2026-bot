@@ -38,8 +38,15 @@ export async function getFixturesByDate(db, date) {
  * net, so a fixture stuck in a bad status (e.g. due to a bug or an ESPN
  * data gap) can't get polled forever — but the bound is generous enough
  * to comfortably cover regulation time + extra time + penalties + delays.
+ *
+ * Accepts an optional `filterFn` (fixture) => boolean. This is how the
+ * group-stage country whitelist gets applied to live polling — without
+ * it, every live/imminent match in D1 would be treated as active
+ * regardless of whether it's a followed team, since this query has no
+ * concept of the whitelist on its own. Pass `null`/omit to get everything
+ * (used during knockout stage, when all matches are tracked).
  */
-export async function getActiveFixtures(db) {
+export async function getActiveFixtures(db, filterFn = null) {
   const now = Date.now();
   const safetyBoundStart = new Date(now - 6 * 60 * 60 * 1000).toISOString();
   const { results } = await db
@@ -52,7 +59,7 @@ export async function getActiveFixtures(db) {
     )
     .bind(safetyBoundStart, new Date(now).toISOString())
     .all();
-  return results;
+  return filterFn ? results.filter(filterFn) : results;
 }
 
 /**
@@ -119,4 +126,4 @@ export async function setState(db, key, value) {
     )
     .bind(key, value)
     .run();
-}
+  }
