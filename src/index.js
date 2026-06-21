@@ -143,9 +143,12 @@ async function runHourlyCheck(env) {
   // or a status update that hadn't landed yet (race condition). Letting
   // only the hourly check own this flag means a single bad minute-poll
   // read can never put the bot to sleep during a live match.
-  const activeOrUpcoming = await getActiveFixtures(env.DB);
+  const activeOrUpcoming = await getActiveFixtures(env.DB, activeFixtureFilter());
   const today    = utcDate(0);
-  const fixtures = await getFixturesByDate(env.DB, today);
+  const allFixtures = await getFixturesByDate(env.DB, today);
+  const fixtures = today <= GROUP_STAGE_END
+    ? filterFixtures(allFixtures, "group")
+    : allFixtures;
   const now      = Date.now();
 
   // A game is "imminent" if it kicks off within the next 70 minutes,
@@ -182,7 +185,7 @@ async function runMinutePoll(env) {
 // ─── Live Polling ─────────────────────────────────────────────────────────────
 
 async function runLivePolling(env) {
-  const activeInDb = await getActiveFixtures(env.DB);
+  const activeInDb = await getActiveFixtures(env.DB, activeFixtureFilter());
   if (activeInDb.length === 0) return;
 
   // Fetch today's full scoreboard — includes live scores and status
@@ -398,6 +401,27 @@ function filterFixtures(fixtures, stage) {
   );
 }
 
+/**
+ * Predicate version of the same whitelist logic, for use with
+ * getActiveFixtures(db, filterFn) instead of filtering an array after
+ * the fact. Stage is read per-fixture (fixtures rows carry their own
+ * `stage` column) since getActiveFixtures can return a mix of group and
+ * knockout matches near the stage boundary.
+ *
+ * Returns null when there's no whitelist to apply (no countries.js, or
+ * we're past the group stage and every match should be tracked) — callers
+ * pass null straight through to getActiveFixtures, which treats null as
+ * "no filtering."
+ */
+function activeFixtureFilter() {
+  if (!FOLLOWED_COUNTRIES || FOLLOWED_COUNTRIES.length === 0) return null;
+  const set = new Set(FOLLOWED_COUNTRIES.map((c) => c.toLowerCase()));
+  return (f) => {
+    if (f.stage === "knockout") return true; // knockout: always tracked
+    return set.has(f.home.toLowerCase()) || set.has(f.away.toLowerCase());
+  };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function deriveFullTimeStatus(statusName) {
@@ -421,4 +445,4 @@ function readableDate(dateStr) {
     day:      "numeric",
     timeZone: "UTC",
   });
-}
+        }
