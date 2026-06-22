@@ -78,22 +78,55 @@ export function formatHalfTime(fixture, homeScore, awayScore, stats) {
   return msg;
 }
 
-export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort) {
+export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort, shootout, winner) {
   const label =
     statusShort === "AET" ? "FULL TIME (AET)" :
     statusShort === "PEN" ? "FULL TIME (Penalties)" :
     "FULL TIME";
 
-  const winner =
-    homeScore > awayScore ? `${fixture.home} win` :
-    awayScore > homeScore ? `${fixture.away} win` :
-    "Draw";
+  // Regulation/ET score is level by definition whenever a match goes to
+  // penalties (that's the entire reason it went to penalties) — so a
+  // PEN result is NEVER a "Draw" overall even when homeScore===awayScore.
+  // We prefer ESPN's own winner:true/false flag (passed in as `winner`,
+  // one of "home"/"away"/"draw"/null) since it's authoritative and
+  // correctly reflects shootout outcomes. Score comparison is only a
+  // fallback for when that flag isn't present in the payload at all.
+  let winnerLine;
+  if (statusShort === "PEN") {
+    if (shootout && (shootout.home != null) && (shootout.away != null)) {
+      winnerLine = shootout.home > shootout.away
+        ? `${fixture.home} win on penalties (${shootout.home}-${shootout.away})`
+        : `${fixture.away} win on penalties (${shootout.away}-${shootout.home})`;
+    } else if (winner === "home") {
+      winnerLine = `${fixture.home} win on penalties`;
+    } else if (winner === "away") {
+      winnerLine = `${fixture.away} win on penalties`;
+    } else {
+      // No shootout score AND no winner flag — we know it went to
+      // penalties but can't confirm who won. Say so rather than guessing.
+      winnerLine = "Decided on penalties";
+    }
+  } else if (winner === "home") {
+    winnerLine = `${fixture.home} win`;
+  } else if (winner === "away") {
+    winnerLine = `${fixture.away} win`;
+  } else if (winner === "draw") {
+    winnerLine = "Draw";
+  } else {
+    // No winner flag in the payload at all — fall back to score
+    // comparison (the old behavior), which is fine for non-PEN results
+    // since the score reliably reflects the outcome outside of shootouts.
+    winnerLine =
+      homeScore > awayScore ? `${fixture.home} win` :
+      awayScore > homeScore ? `${fixture.away} win` :
+      "Draw";
+  }
 
   let msg =
     `${label}\n` +
     `${fixture.round}\n` +
     `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}\n` +
-    `${winner}`;
+    `${winnerLine}`;
 
   const statsBlock = formatStatsBlock(stats);
   if (statsBlock) msg += `\n\n${statsBlock}`;
@@ -205,4 +238,4 @@ function groupByDate(fixtures) {
     acc[date].push(f);
     return acc;
   }, {});
-}
+    }
