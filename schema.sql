@@ -1,5 +1,6 @@
 -- FIFA World Cup 2026 Bot — D1 Schema
 -- Run via: wrangler d1 execute wc2026 --file=schema.sql
+-- (or paste into the D1 Console tab in the Cloudflare dashboard)
 
 CREATE TABLE IF NOT EXISTS fixtures (
   id          INTEGER PRIMARY KEY,   -- API-Football fixture ID
@@ -25,3 +26,14 @@ CREATE TABLE IF NOT EXISTS bot_state (
 -- Rows used:
 --   group_schedule_posted  → "1" once full group stage schedule has been posted
 --   daily_schedule_{date}  → "1" once tomorrow's schedule posted for that date
+
+-- NEW: event_log — lightweight activity log the bot writes to itself,
+-- so the admin dashboard has something to show without needing access
+-- to Cloudflare's real invocation logs (which aren't readable via API
+-- from inside the Worker).
+CREATE TABLE IF NOT EXISTS event_log (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts        TEXT    NOT NULL,        -- ISO 8601 timestamp
+  level     TEXT    NOT NULL,        -- "info" | "warn" | "error"
+  message   TEXT    NOT NULL
+);

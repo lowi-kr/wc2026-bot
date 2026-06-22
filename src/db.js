@@ -33,22 +33,13 @@ export async function getFixturesByDate(db, date) {
 }
 
 /**
- * Get fixtures that are currently active: status is not yet finished.
- * Bounded to fixtures that kicked off within the last 6 hours as a safety
- * net, so a fixture stuck in a bad status (e.g. due to a bug or an ESPN
- * data gap) can't get polled forever — but the bound is generous enough
- * to comfortably cover regulation time + extra time + penalties + delays.
- *
- * Accepts an optional `filterFn` (fixture) => boolean. This is how the
- * group-stage country whitelist gets applied to live polling — without
- * it, every live/imminent match in D1 would be treated as active
- * regardless of whether it's a followed team, since this query has no
- * concept of the whitelist on its own. Pass `null`/omit to get everything
- * (used during knockout stage, when all matches are tracked).
+ * Get fixtures that are currently active:
+ * kicked off in the last 130 minutes and not yet marked FT/AET/PEN.
  */
-export async function getActiveFixtures(db, filterFn = null) {
+export async function getActiveFixtures(db) {
   const now = Date.now();
-  const safetyBoundStart = new Date(now - 6 * 60 * 60 * 1000).toISOString();
+  const windowStart = new Date(now - 130 * 60 * 1000).toISOString();
+  const windowEnd = new Date(now).toISOString();
   const { results } = await db
     .prepare(
       `SELECT * FROM fixtures
@@ -57,9 +48,9 @@ export async function getActiveFixtures(db, filterFn = null) {
          AND status NOT IN ('FT', 'AET', 'PEN')
        ORDER BY kickoff_utc ASC`
     )
-    .bind(safetyBoundStart, new Date(now).toISOString())
+    .bind(windowStart, windowEnd)
     .all();
-  return filterFn ? results.filter(filterFn) : results;
+  return results;
 }
 
 /**
@@ -80,6 +71,16 @@ export async function markSchedulePosted(db, fixtureId) {
     .prepare(`UPDATE fixtures SET posted_schedule = 1 WHERE id = ?`)
     .bind(fixtureId)
     .run();
+}
+
+/**
+ * Get a single fixture by id. Used by the admin dashboard.
+ */
+export async function getFixtureById(db, fixtureId) {
+  return db
+    .prepare(`SELECT * FROM fixtures WHERE id = ?`)
+    .bind(fixtureId)
+    .first();
 }
 
 // ─── Seen Events ──────────────────────────────────────────────────────────────
@@ -126,4 +127,52 @@ export async function setState(db, key, value) {
     )
     .bind(key, value)
     .run();
+}
+
+// ─── Event Log ────────────────────────────────────────────────────────────────
+// A simple self-written activity log so the admin dashboard has something
+// to show. NOT a replacement for Cloudflare's real logs (still use
+// `wrangler tail` or the dashboard Logs tab for deep debugging) — this is
+// just a rolling history of "what did the bot decide and do."
+
+/**
+ * Write one line to the event log. Never throws — logging should never
+ * be allowed to break the calling code path.
+ */
+export async function logEvent(db, level, message) {
+  try {
+    await db
+      .prepare(`INSERT INTO event_log (ts, level, message) VALUES (?, ?, ?)`)
+      .bind(new Date().toISOString(), level, message)
+      .run();
+  } catch (err) {
+    // Swallow — logging failures shouldn't take down the bot.
+    console.error("logEvent failed:", err);
   }
+}
+
+/**
+ * Get the most recent N log lines, newest first.
+ */
+export async function getRecentLogs(db, limit = 100) {
+  const { results } = await db
+    .prepare(`SELECT id, ts, level, message FROM event_log ORDER BY id DESC LIMIT ?`)
+    .bind(limit)
+    .all();
+  return results;
+}
+
+/**
+ * Trim the log table so it doesn't grow forever. Keeps the most recent
+ * `keep` rows. Cheap to call opportunistically (e.g. once a day).
+ */
+export async function trimEventLog(db, keep = 500) {
+  await db
+    .prepare(
+      `DELETE FROM event_log WHERE id NOT IN (
+         SELECT id FROM event_log ORDER BY id DESC LIMIT ?
+       )`
+    )
+    .bind(keep)
+    .run();
+}
