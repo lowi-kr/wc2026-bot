@@ -78,22 +78,64 @@ export function formatHalfTime(fixture, homeScore, awayScore, stats) {
   return msg;
 }
 
-export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort) {
+/**
+ * @param {object} fixture
+ * @param {number} homeScore
+ * @param {number} awayScore
+ * @param {Array|null} stats — ESPN boxscore.teams
+ * @param {string} statusShort — "FT" | "AET" | "PEN"
+ * @param {{home:number,away:number}|null} shootout — penalty shootout score, if known
+ * @param {"home"|"away"|"draw"|null} winner — ESPN's winner:true/false flag, normalized
+ */
+export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort, shootout, winner) {
   const label =
     statusShort === "AET" ? "FULL TIME (AET)" :
     statusShort === "PEN" ? "FULL TIME (Penalties)" :
     "FULL TIME";
 
-  const winner =
-    homeScore > awayScore ? `${fixture.home} win` :
-    awayScore > homeScore ? `${fixture.away} win` :
-    "Draw";
+  // Regulation/ET score is level by definition whenever a match goes to
+  // penalties (that's the entire reason it went to penalties) — so a
+  // PEN result is NEVER a "Draw" overall even when homeScore===awayScore.
+  // We prefer ESPN's own winner:true/false flag (passed in as `winner`,
+  // one of "home"/"away"/"draw"/null) since it's authoritative and
+  // correctly reflects shootout outcomes. Score comparison is only a
+  // fallback for when that flag isn't present in the payload at all.
+  let winnerLine;
+  if (statusShort === "PEN") {
+    if (shootout && (shootout.home != null) && (shootout.away != null)) {
+      winnerLine = shootout.home > shootout.away
+        ? `${fixture.home} win on penalties (${shootout.home}-${shootout.away})`
+        : `${fixture.away} win on penalties (${shootout.away}-${shootout.home})`;
+    } else if (winner === "home") {
+      winnerLine = `${fixture.home} win on penalties`;
+    } else if (winner === "away") {
+      winnerLine = `${fixture.away} win on penalties`;
+    } else {
+      // No shootout score AND no winner flag — we know it went to
+      // penalties but can't confirm who won. Say so rather than guessing.
+      winnerLine = "Decided on penalties";
+    }
+  } else if (winner === "home") {
+    winnerLine = `${fixture.home} win`;
+  } else if (winner === "away") {
+    winnerLine = `${fixture.away} win`;
+  } else if (winner === "draw") {
+    winnerLine = "Draw";
+  } else {
+    // No winner flag in the payload at all — fall back to score
+    // comparison (the old behavior), which is fine for non-PEN results
+    // since the score reliably reflects the outcome outside of shootouts.
+    winnerLine =
+      homeScore > awayScore ? `${fixture.home} win` :
+      awayScore > homeScore ? `${fixture.away} win` :
+      "Draw";
+  }
 
   let msg =
     `${label}\n` +
     `${fixture.round}\n` +
     `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}\n` +
-    `${winner}`;
+    `${winnerLine}`;
 
   const statsBlock = formatStatsBlock(stats);
   if (statsBlock) msg += `\n\n${statsBlock}`;
@@ -169,12 +211,12 @@ export function formatGenericGoal(fixture, homeScore, awayScore) {
  * key across feeds/seasons, but every entry also carries a human-readable
  * `label` (and often an `abbreviation`). We match against a list of known
  * aliases per stat against name/label/abbreviation (lowercased, with
- * non-alphanumeric characters stripped) instead of trusting one exact key.
- * Any stat with no match on either side is left out of the message
- * entirely rather than rendered as a placeholder "-" — so the block always
- * reflects what ESPN actually sent, and silently grows if ESPN adds stats
- * we haven't aliased yet (we just won't show them) rather than silently
- * showing wrong/empty values for stats we expected but couldn't find.
+ * non-alphanumeric characters stripped) instead of trusting one exact key
+ * — this is the actual fix for corners/fouls showing up as "-": the old
+ * code matched only the literal names "cornerKicks"/"fouls", which aren't
+ * what ESPN's soccer feed actually uses for those two stats. Any stat with
+ * no match on either side is left out of the message entirely rather than
+ * rendered as a placeholder "-".
  */
 function formatStatsBlock(stats) {
   if (!stats || stats.length < 2) return null;
@@ -186,7 +228,7 @@ function formatStatsBlock(stats) {
     { label: "Possession",   aliases: ["possessionpct", "possession", "ballpossession", "possession%"] },
     { label: "Shots",        aliases: ["totalshots", "shotstotal", "shots"] },
     { label: "On Target",    aliases: ["shotsontarget", "shotsongoal", "ontargetscoringatt", "totalshotsontarget"] },
-    { label: "Corners",      aliases: ["cornerkicks", "wontcorners", "wonCorners".toLowerCase(), "corners", "cornerkicksearned"] },
+    { label: "Corners",      aliases: ["cornerkicks", "wontcorners", "corners", "cornerkicksearned"] },
     { label: "Fouls",        aliases: ["fouls", "foulscommitted", "foulscommited"] },
     { label: "Yellow Cards", aliases: ["yellowcards", "totalyellowcards"] },
     { label: "Red Cards",    aliases: ["redcards", "totalredcards"] },
@@ -263,4 +305,4 @@ function groupByDate(fixtures) {
     acc[date].push(f);
     return acc;
   }, {});
-                               }
+}
