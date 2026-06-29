@@ -12,9 +12,12 @@
 
 import { fetchFixturesInRange, fetchFixturesByDate, fetchLiveFixtures, fetchEvents, fetchStats, ESPN_STATUS } from "./api.js";
 import { postToGroupMe } from "./groupme.js";
-import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatHalfTime, formatFullTime, formatEvent, formatGenericGoal } from "./formatter.js";
-import { upsertFixtures, getFixturesByDate, getActiveFixtures, updateFixtureStatus, getSeenEvents, insertSeenEvent, getState, setState, logEvent, trimEventLog } from "./db.js";
-import { handleAdminRequest } from "./admin.js";
+import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatHalfTime, formatFullTime, formatFinalStatsFollowUp, formatEvent, formatGenericGoal } from "./formatter.js";
+import {
+  upsertFixtures, getFixturesByDate, getActiveFixtures, getFixturesPendingStats,
+  updateFixtureStatus, markStatsPending, clearStatsPending, setFinalScore,
+  getSeenEvents, insertSeenEvent, getState, setState, writeEventLog,
+} from "./db.js";
 
 // Try to import country filter — if the file is deleted, no filter is applied.
 let FOLLOWED_COUNTRIES = null;
@@ -27,20 +30,15 @@ try {
 
 // ─── World Cup 2026 Dates ─────────────────────────────────────────────────────
 const GROUP_STAGE_START = "2026-06-11";
-const GROUP_STAGE_END   = "2026-06-26";
+const GROUP_STAGE_END   = "2026-06-27";
 
 // KV keys
 const KV_GAMES_TODAY    = "games_today";      // "1" or "0"
 const KV_GAME_IMMINENT  = "game_imminent";    // "1" or "0"
 
-// Job functions handed to admin.js so the dashboard's "manual run" buttons
-// can call the real cron logic without a circular import.
-const JOB_FNS = {
-  runDailyJob,
-  runHourlyCheck,
-  runMidnightCheck,
-  runLivePolling,
-};
+// How many times to retry fetching full-time stats if they weren't ready
+// at the moment FULL TIME was posted, before giving up silently.
+const FT_STATS_MAX_RETRIES = 5;
 
 // ─── Cron Entry Point ─────────────────────────────────────────────────────────
 export default {
@@ -50,8 +48,6 @@ export default {
     if (cron === "0 0 * * *") {
       // Midnight UTC — check if there are games today
       ctx.waitUntil(runMidnightCheck(env));
-      // Opportunistic cleanup so event_log doesn't grow forever
-      ctx.waitUntil(trimEventLog(env.DB, 500));
     } else if (cron === "0 8 * * *") {
       // 8AM UTC — post tomorrow's knockout schedule + fetch fixtures into D1
       ctx.waitUntil(runDailyJob(env));
@@ -64,13 +60,9 @@ export default {
     }
   },
 
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url    = new URL(request.url);
     const action = url.searchParams.get("action");
-
-    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
-      return handleAdminRequest(request, env, ctx, url, JOB_FNS);
-    }
 
     if (action === "init") {
       await initGroupStage(env);
@@ -96,8 +88,7 @@ export default {
       const id = url.searchParams.get("id");
       if (!id) return new Response("Missing ?id=", { status: 400 });
       await env.DB.prepare("DELETE FROM seen_events WHERE fixture_id = ?").bind(id).run();
-      await env.DB.prepare("UPDATE fixtures SET status = 'NS' WHERE id = ?").bind(id).run();
-      await logEvent(env.DB, "info", `[action=reset_fixture] fixture ${id} reset to NS`);
+      await env.DB.prepare("UPDATE fixtures SET status = 'NS', stats_pending = 0 WHERE id = ?").bind(id).run();
       return new Response(`Fixture ${id} reset.`);
     }
     if (action === "status") {
@@ -110,8 +101,6 @@ export default {
 
     return new Response(
       "WC2026 Bot running.\n\n" +
-      "Dashboard:\n" +
-      "  /admin                       - Password-protected admin dashboard\n\n" +
       "Manual triggers (GET):\n" +
       "  ?action=init                 - One-time: load group stage fixtures + post schedule\n" +
       "  ?action=daily                - Run daily job (post tomorrow's schedule)\n" +
@@ -143,11 +132,6 @@ async function runMidnightCheck(env) {
   // Reset imminent flag at midnight
   await env.KV.put(KV_GAME_IMMINENT, "0", { expirationTtl: 60 * 60 * 26 });
   console.log(`Midnight check: games_today=${hasGames}, ${relevant.length} fixtures found.`);
-  await logEvent(
-    env.DB,
-    "info",
-    `[midnight] games_today=${hasGames} (${relevant.length} fixture(s) found for ${today})`
-  );
 }
 
 // ─── Hourly Check ─────────────────────────────────────────────────────────────
@@ -179,7 +163,6 @@ async function runHourlyCheck(env) {
     expirationTtl: 60 * 60 * 2,
   });
   console.log(`Hourly check: game_imminent=${imminent}`);
-  await logEvent(env.DB, "info", `[hourly] game_imminent=${imminent}`);
 }
 
 // ─── Minute Poll ──────────────────────────────────────────────────────────────
@@ -190,21 +173,23 @@ async function runMinutePoll(env) {
   if (imminent !== "1") return; // Exit instantly — no game imminent
 
   await runLivePolling(env);
+  await runStatsRetry(env);
 
-  // After polling, check if all active games are now finished
-  // If so, clear the imminent flag so the minute cron goes back to sleep
-  const activeInDb = await getActiveFixtures(env.DB);
-  if (activeInDb.length === 0) {
+  // After polling, check if all active games are now finished AND no
+  // fixture is still waiting on a final-stats retry. If so, clear the
+  // imminent flag so the minute cron goes back to sleep.
+  const activeInDb  = await getActiveFixtures(env.DB, activeFixtureFilter());
+  const pendingStats = await getFixturesPendingStats(env.DB);
+  if (activeInDb.length === 0 && pendingStats.length === 0) {
     await env.KV.put(KV_GAME_IMMINENT, "0", { expirationTtl: 60 * 60 * 2 });
-    console.log("All games finished — cleared game_imminent flag.");
-    await logEvent(env.DB, "info", "[minute] all active games finished — cleared game_imminent");
+    console.log("All games finished and no pending stats — cleared game_imminent flag.");
   }
 }
 
 // ─── Live Polling ─────────────────────────────────────────────────────────────
 
 async function runLivePolling(env) {
-  const activeInDb = await getActiveFixtures(env.DB);
+  const activeInDb = await getActiveFixtures(env.DB, activeFixtureFilter());
   if (activeInDb.length === 0) return;
 
   // Fetch today's full scoreboard — includes live scores and status
@@ -213,7 +198,6 @@ async function runLivePolling(env) {
     liveEvents = await fetchLiveFixtures(env);
   } catch (err) {
     console.error("Failed to fetch live fixtures from ESPN:", err);
-    await logEvent(env.DB, "error", `[live] failed to fetch live fixtures from ESPN: ${err.message}`);
     return;
   }
 
@@ -245,7 +229,6 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
   if (prevStatus === "NS" && state === ESPN_STATUS.IN && statusName !== "STATUS_HALFTIME") {
     await postToGroupMe(env, formatKickoff(dbFixture));
     await updateFixtureStatus(env.DB, dbFixture.id, "LIVE");
-    await logEvent(env.DB, "info", `[live] kickoff posted: ${dbFixture.home} vs ${dbFixture.away} (id ${dbFixture.id})`);
     return;
   }
 
@@ -256,11 +239,14 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
       htStats = await fetchStats(env, dbFixture.id);
     } catch (err) {
       console.error(`Could not fetch HT stats for ${dbFixture.id}:`, err);
-      await logEvent(env.DB, "warn", `[live] could not fetch HT stats for fixture ${dbFixture.id}: ${err.message}`);
     }
+    // One-time diagnostic: HT is the most reliable point to capture a real
+    // stats shape, since FT stats are sometimes still empty at the moment
+    // the match ends. Shares the same per-fixture flag as the FT capture
+    // below, so only the first one to fire actually logs anything.
+    await logRawShapeOnce(env, `stats_shape_${dbFixture.id}`, "boxscore_team", htStats?.[0]);
     await postToGroupMe(env, formatHalfTime(dbFixture, homeScore, awayScore, htStats));
     await updateFixtureStatus(env.DB, dbFixture.id, "HT");
-    await logEvent(env.DB, "info", `[live] half-time posted: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away}`);
     return;
   }
 
@@ -300,13 +286,12 @@ async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
     return;
   }
 
-  // Score changed since last seen — find which goal play matches this score
+  // Score changed since last seen — find which goal play matches this score.
   let plays;
   try {
     plays = await fetchEvents(env, dbFixture.id);
   } catch (err) {
     console.error(`Failed to fetch plays for fixture ${dbFixture.id}:`, err);
-    await logEvent(env.DB, "warn", `[live] failed to fetch plays for fixture ${dbFixture.id}: ${err.message}`);
     // Still record the score so we don't loop forever retrying
     await insertSeenEvent(env.DB, dbFixture.id, scoreKey);
     return;
@@ -316,15 +301,57 @@ async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
     (p.type?.text || "").toLowerCase().includes("goal")
   );
 
-  // Post the most recent goal play (last one in the array is most recent)
-  const latestGoal = goalPlays[goalPlays.length - 1];
-  const msg = latestGoal
+  // One-time diagnostic: capture the raw shape of a goal play so the actual
+  // ESPN field names for a play's running score can be confirmed (see the
+  // findGoalMatchingScore guesses below). Logs once per fixture, then never
+  // again — won't spam event_log across the rest of the match.
+  await logRawShapeOnce(env, `goal_play_shape_${dbFixture.id}`, "goal_play", goalPlays[0] || plays[0]);
+
+  // IMPORTANT: don't assume the *last* goal play in the array is the one
+  // that produced the *current* scoreboard score — ESPN's /plays feed and
+  // the scoreboard score can be a poll or two out of sync with each other.
+  // Instead, find the goal play whose own running score actually matches
+  // homeScore/awayScore. ESPN goal plays carry the score the match was AT
+  // after that goal under awayScore/homeScore (or scoreValue) fields on
+  // the play itself when present; fall back to position-based matching
+  // only if no play's own score lines up, and fall back further to a
+  // generic message (no stale minute) if we still can't tell.
+  const matchingGoal = findGoalMatchingScore(goalPlays, homeScore, awayScore);
+  const latestGoal    = matchingGoal || goalPlays[goalPlays.length - 1];
+
+  // If we can't find an exact score match AND the play list doesn't even
+  // have as many goals as the new total score implies, the /plays feed is
+  // simply behind — post the generic (minute-less) goal message instead of
+  // repeating a stale minute from an earlier goal.
+  const totalGoalsImplied = homeScore + awayScore;
+  const feedLooksStale    = !matchingGoal && goalPlays.length < totalGoalsImplied;
+
+  const msg = !feedLooksStale && latestGoal
     ? formatEvent(latestGoal, dbFixture, homeScore, awayScore)
     : formatGenericGoal(dbFixture, homeScore, awayScore);
 
   if (msg) await postToGroupMe(env, msg);
   await insertSeenEvent(env.DB, dbFixture.id, scoreKey);
-  await logEvent(env.DB, "info", `[live] goal posted: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away}`);
+}
+
+/**
+ * Look through goalPlays for the one whose own recorded score matches the
+ * scoreboard's current homeScore/awayScore. ESPN's play objects sometimes
+ * carry the post-goal score under different keys depending on the feed
+ * version, so we check a few plausible shapes.
+ */
+function findGoalMatchingScore(goalPlays, homeScore, awayScore) {
+  for (let i = goalPlays.length - 1; i >= 0; i--) {
+    const p = goalPlays[i];
+    const playHome = p.homeScore ?? p.scoreValue?.home ?? p.team?.score?.home;
+    const playAway = p.awayScore ?? p.scoreValue?.away ?? p.team?.score?.away;
+    if (playHome != null && playAway != null) {
+      if (parseInt(playHome, 10) === homeScore && parseInt(playAway, 10) === awayScore) {
+        return p;
+      }
+    }
+  }
+  return null;
 }
 
 async function handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, ftStatus) {
@@ -333,18 +360,106 @@ async function handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, f
     stats = await fetchStats(env, dbFixture.id);
   } catch (err) {
     console.error(`Could not fetch stats for ${dbFixture.id}:`, err);
-    await logEvent(env.DB, "warn", `[live] could not fetch FT stats for fixture ${dbFixture.id}: ${err.message}`);
   }
+
+  // One-time diagnostic: capture the raw shape of a boxscore team's stats
+  // so the actual ESPN stat names (corners, fouls, etc.) can be confirmed
+  // against what formatStatsBlock's alias list expects. Logs once per
+  // fixture, then never again.
+  await logRawShapeOnce(env, `stats_shape_${dbFixture.id}`, "boxscore_team", stats?.[0]);
+
+  // Write status BEFORE posting to GroupMe (avoids re-posting FULL TIME
+  // repeatedly if the GroupMe call itself fails).
+  await updateFixtureStatus(env.DB, dbFixture.id, ftStatus);
+  await setFinalScore(env.DB, dbFixture.id, homeScore, awayScore);
 
   const msg = formatFullTime(dbFixture, homeScore, awayScore, stats, ftStatus);
   await postToGroupMe(env, msg);
-  await updateFixtureStatus(env.DB, dbFixture.id, ftStatus);
+
+  // ESPN's boxscore frequently isn't populated yet in the same instant the
+  // match flips to "post" status — ask the minute-poll cron to retry stats
+  // shortly after, and post a short FINAL STATS follow-up if/when they show up.
+  if (!stats || stats.length < 2) {
+    await markStatsPending(env.DB, dbFixture.id);
+    console.log(`FT stats not ready yet for fixture ${dbFixture.id} — will retry.`);
+  }
+
   console.log(`Match ended: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away} (${ftStatus})`);
-  await logEvent(
-    env.DB,
-    "info",
-    `[live] match ended: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away} (${ftStatus})`
-  );
+}
+
+/**
+ * Retries fetching stats for any recently-finished fixture still flagged
+ * as stats_pending. Runs as part of the minute poll. Posts a FINAL STATS
+ * follow-up message as soon as stats become available, then clears the
+ * flag. Gives up (clearing the flag without posting) after enough retries
+ * that another minute cron run won't keep trying forever.
+ */
+async function runStatsRetry(env) {
+  const pending = await getFixturesPendingStats(env.DB);
+  if (pending.length === 0) return;
+
+  for (const fixture of pending) {
+    let stats = null;
+    try {
+      stats = await fetchStats(env, fixture.id);
+    } catch (err) {
+      console.error(`Stats retry fetch failed for fixture ${fixture.id}:`, err);
+    }
+
+    if (stats && stats.length >= 2) {
+      const msg = formatFinalStatsFollowUp(
+        fixture,
+        fixture.final_home_score,
+        fixture.final_away_score,
+        stats
+      );
+      if (msg) {
+        await postToGroupMe(env, msg);
+        await clearStatsPending(env.DB, fixture.id);
+        console.log(`Posted delayed FINAL STATS for fixture ${fixture.id}.`);
+        continue;
+      }
+    }
+
+    const attempts = (await getRetryCount(env.DB, fixture.id)) + 1;
+    await setRetryCount(env.DB, fixture.id, attempts);
+    if (attempts >= FT_STATS_MAX_RETRIES) {
+      await clearStatsPending(env.DB, fixture.id);
+      console.log(`Giving up on FT stats retry for fixture ${fixture.id} after ${attempts} attempts.`);
+    }
+  }
+}
+
+const RETRY_STATE_PREFIX = "ft_stats_retries_";
+
+async function getRetryCount(db, fixtureId) {
+  const val = await getState(db, `${RETRY_STATE_PREFIX}${fixtureId}`);
+  return val ? parseInt(val, 10) : 0;
+}
+
+async function setRetryCount(db, fixtureId, count) {
+  await setState(db, `${RETRY_STATE_PREFIX}${fixtureId}`, String(count));
+}
+
+// ─── One-Time Shape Capture ───────────────────────────────────────────────────
+// Temporary diagnostic aid: writes the raw ESPN object for a goal play or a
+// boxscore team's stats to event_log (visible in the admin dashboard's
+// activity feed) the FIRST time we see one for a given fixture, then never
+// again for that fixture — so this can't spam the log across a full match.
+// Safe to remove once the real field names (goal score fields, stat names)
+// have been confirmed from a live response.
+
+async function logRawShapeOnce(env, stateKey, label, payload) {
+  if (!payload) return;
+  const already = await getState(env.DB, stateKey);
+  if (already === "1") return;
+  await setState(env.DB, stateKey, "1");
+  const json = JSON.stringify(payload);
+  // event_log.message is a plain TEXT column with no length cap enforced
+  // here — truncate defensively so one giant object can't bloat the table.
+  const truncated = json.length > 4000 ? json.slice(0, 4000) + "...[truncated]" : json;
+  await writeEventLog(env.DB, "debug", `[shape-capture:${label}] ${truncated}`);
+  console.log(`[shape-capture:${label}]`, json);
 }
 
 async function checkIfFinished(env, dbFixture) {
@@ -358,7 +473,6 @@ async function checkIfFinished(env, dbFixture) {
     }
   } catch (err) {
     console.error(`checkIfFinished error for fixture ${dbFixture.id}:`, err);
-    await logEvent(env.DB, "warn", `[live] checkIfFinished error for fixture ${dbFixture.id}: ${err.message}`);
   }
 }
 
@@ -385,11 +499,6 @@ async function initGroupStage(env) {
   await postToGroupMe(env, msg);
   await setState(env.DB, "group_schedule_posted", "1");
   console.log(`Group stage initialized. ${all.length} fixtures stored, ${filtered.length} in schedule post.`);
-  await logEvent(
-    env.DB,
-    "info",
-    `[init] group stage initialized: ${all.length} fixtures stored, ${filtered.length} in schedule post`
-  );
 }
 
 // ─── Daily Job (8AM UTC) ──────────────────────────────────────────────────────
@@ -417,7 +526,6 @@ async function runDailyJob(env, force = false) {
   await postToGroupMe(env, msg);
   await setState(env.DB, stateKey, "1");
   console.log(`Daily schedule posted for ${tomorrow}: ${fixtures.length} fixtures.`);
-  await logEvent(env.DB, "info", `[daily] schedule posted for ${tomorrow}: ${fixtures.length} fixture(s)`);
 }
 
 // ─── Country Filter ───────────────────────────────────────────────────────────
@@ -429,6 +537,22 @@ function filterFixtures(fixtures, stage) {
   return fixtures.filter(
     (f) => set.has(f.home.toLowerCase()) || set.has(f.away.toLowerCase())
   );
+}
+
+/**
+ * Returns a filter function for getActiveFixtures() that restricts results
+ * to followed countries during the group stage (knockout stage always
+ * tracks everything). Used by both runLivePolling and runMinutePoll so the
+ * two stay in agreement about what counts as "active".
+ */
+function activeFixtureFilter() {
+  return (f) => {
+    const isGroupStage = f.kickoff_utc.split("T")[0] <= GROUP_STAGE_END;
+    if (!isGroupStage) return true;
+    if (!FOLLOWED_COUNTRIES || FOLLOWED_COUNTRIES.length === 0) return true;
+    const set = new Set(FOLLOWED_COUNTRIES.map((c) => c.toLowerCase()));
+    return set.has(f.home.toLowerCase()) || set.has(f.away.toLowerCase());
+  };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -454,4 +578,4 @@ function readableDate(dateStr) {
     day:      "numeric",
     timeZone: "UTC",
   });
-}
+  }
