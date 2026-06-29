@@ -12,8 +12,8 @@ All messages are plain ASCII text (no emojis) since GroupMe's SMS fallback can't
 - Tomorrow's matches every morning at 8AM UTC (during the knockout stage)
 - A kickoff alert when a match starts
 - A message every time the score changes (goal), with scorer name when available
-- Half-time score with match stats (possession, shots, corners, fouls)
-- Full-time result with match stats
+- Half-time score with match stats (possession, shots, corners, fouls, and more when available)
+- Full-time result with match stats (occasionally followed by a short FINAL STATS message if stats weren't ready yet)
 
 > This bot does not currently post live cards, substitutions, or commentary — only goals, because no free, reliable source for live play-by-play commentary was available at setup time. See the note in `src/api.js` if you want to add a richer data source later (e.g. during the knockout rounds).
 
@@ -115,7 +115,10 @@ CREATE TABLE IF NOT EXISTS fixtures (
   round       TEXT    NOT NULL,
   stage       TEXT    NOT NULL,
   status      TEXT    NOT NULL DEFAULT 'NS',
-  posted_schedule INTEGER NOT NULL DEFAULT 0
+  posted_schedule  INTEGER NOT NULL DEFAULT 0,
+  stats_pending    INTEGER NOT NULL DEFAULT 0,
+  final_home_score INTEGER,
+  final_away_score INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS seen_events (
@@ -128,7 +131,25 @@ CREATE TABLE IF NOT EXISTS bot_state (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS event_log (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      TEXT NOT NULL,
+  level   TEXT NOT NULL,
+  message TEXT NOT NULL
+);
 ```
+
+> **Already ran this before and just see a "table already exists" message?** That's fine — it means your tables exist already. If you set this up before `stats_pending`, `final_home_score`, or `final_away_score` existed, run these three lines too (paste one at a time — the Console's input box can mangle line breaks on a multi-line paste):
+> ```sql
+> ALTER TABLE fixtures ADD COLUMN stats_pending INTEGER NOT NULL DEFAULT 0;
+> ```
+> ```sql
+> ALTER TABLE fixtures ADD COLUMN final_home_score INTEGER;
+> ```
+> ```sql
+> ALTER TABLE fixtures ADD COLUMN final_away_score INTEGER;
+> ```
 
 3. You should see a success message. The database is ready.
 
@@ -187,6 +208,18 @@ This is different from Step 4d — those were build-time values used only during
 
 This triggers a small redeploy automatically so the bot picks up the new value.
 
+### 4f — Add the admin dashboard password (runtime variable)
+
+The bot includes a password-protected dashboard at `/admin` for checking on things and triggering jobs manually without using URL query parameters. This step turns it on.
+
+1. Still on the **Variables and secrets** page from Step 4e, click **+ Add** again
+2. Choose type **Secret**
+3. **Name**: `DASHBOARD_PASSWORD`
+4. **Value**: any password you'll remember — this is the only thing standing between someone and your dashboard, so don't reuse a password you use elsewhere, but it doesn't need to be elaborate
+5. Click **Save**
+
+If you skip this step, visiting `/admin` will always show "Unauthorized" — the dashboard fails closed without a password configured, on purpose.
+
 ---
 
 ## Step 5 — Initialize the bot (run once)
@@ -218,8 +251,9 @@ This means on a day with no tracked matches, the bot makes a small number of che
 **What gets posted during a live match:**
 - A kickoff message when the match starts
 - A message each time the score changes (a goal), naming the scorer when available
-- A half-time message with current stats (possession, shots, corners, fouls)
+- A half-time message with current stats (possession, shots, corners, fouls, and a few more when ESPN provides them)
 - A full-time message with the final score and stats
+- Occasionally, a short follow-up **FINAL STATS** message a minute or two after full time — ESPN's stats sometimes aren't ready the instant a match ends, so the bot retries a few times in the background rather than holding up the result itself
 
 **During the group stage (June 11–26):** only matches involving Spain, France, England, Argentina, Portugal, and USA are tracked.
 
@@ -227,11 +261,29 @@ This means on a day with no tracked matches, the bot makes a small number of che
 
 ---
 
+## Admin Dashboard
+
+Visit `https://wc2026-bot.YOUR-NAME.workers.dev/admin` and log in with the `DASHBOARD_PASSWORD` you set in Step 4f. From there you can see, without needing to remember any URL query parameters:
+
+- **Current flag states** — `games_today` and `game_imminent`, with one-click buttons to force either ON or OFF (useful if the bot's automatic checks got something wrong and you don't want to wait for the next hourly/midnight cycle)
+- **Today's fixtures** and any **currently active** fixtures (within the live-polling window), with their status and ESPN fixture ID
+- **Manual action buttons** — refresh today's fixtures from ESPN, or run the midnight/hourly/live jobs on demand
+- **Reset a fixture** by ID — same as the `?action=reset_fixture` URL, but with a form instead of typing a query string
+- **Recent activity log** — the last 100 things the bot has logged about its own decisions (kickoffs, goals, half-time/full-time posts, errors, manual overrides), newest first
+
+This is meant for quick checks and nudges from your phone — it's not a replacement for Cloudflare's own Logs tab (Workers & Pages → wc2026-bot → Logs), which still has the full, unfiltered picture for deep debugging.
+
+The login is a single shared password good for 24 hours at a time (you'll need to log in again the next day). It's intentionally simple — good enough to keep randoms out, not meant to gate anything more sensitive than your bot's own flags and fixture data.
+
+---
+
 ## Troubleshooting
 
+Most of what's below can also be checked or triggered from the [Admin Dashboard](#admin-dashboard) at `/admin` instead of typing URLs — whichever's easier for you.
+
 **The bot isn't posting anything**
-- Visit `https://wc2026-bot.YOUR-NAME.workers.dev/?action=status` — it shows the current `games_today` and `game_imminent` flags. If both say `0` and you know a tracked match is live, something is wrong with the schedule data (try `?action=init` again) or the country filter
-- Go to Cloudflare Dashboard → Workers & Pages → wc2026-bot → **Logs** to see errors
+- Visit `https://wc2026-bot.YOUR-NAME.workers.dev/?action=status` (or check the Flags section of `/admin`) — it shows the current `games_today` and `game_imminent` flags. If both say `0` and you know a tracked match is live, something is wrong with the schedule data (try `?action=init` again) or the country filter
+- Go to Cloudflare Dashboard → Workers & Pages → wc2026-bot → **Logs** to see errors (or check **Recent activity** on `/admin` for a friendlier summary)
 - Double-check that `GROUPME_BOT_ID` was entered correctly in Step 4e
 
 **The deploy failed**
@@ -248,13 +300,16 @@ This means on a day with no tracked matches, the bot makes a small number of che
   Then visit `?action=init` again
 
 **I want to force the bot to check for a live match right now** (for testing, doesn't wait for the hourly/minute cycle)
-- Visit `?action=live`
+- Visit `?action=live` (or click "Run live poll now" on `/admin`)
+
+**I can't log into `/admin`, it just says Unauthorized**
+- You haven't set the `DASHBOARD_PASSWORD` secret yet — see Step 4f. Without it, the dashboard fails closed on purpose rather than letting anyone in.
 
 ---
 
 ## Manual triggers
 
-You can trigger bot actions by visiting these URLs in your browser:
+You can trigger bot actions by visiting these URLs in your browser, or by using the buttons on the [Admin Dashboard](#admin-dashboard) at `/admin` instead:
 
 | URL | What it does |
 |-----|-------------|
@@ -264,7 +319,7 @@ You can trigger bot actions by visiting these URLs in your browser:
 | `?action=hourly` | Re-runs the hourly "is a game imminent" check right now |
 | `?action=live` | Forces a live-score check right now, bypassing the flags |
 | `?action=status` | Shows the current `games_today` / `game_imminent` flag values |
-| `?action=reset_fixture&id=FIXTURE_ID` | Resets a match so it re-posts (for testing) |
+| `?action=reset_fixture&id=FIXTURE_ID` | Resets a match (status, seen events, and any pending final-stats retry) so it re-posts from scratch — for testing |
 
 ---
 
@@ -291,6 +346,7 @@ If unsure, you can check the exact spelling ESPN uses by visiting this link in y
 wc2026-bot/
 ├── src/
 │   ├── index.js       # Main logic — cron jobs, 3-tier polling, match flow
+│   ├── admin.js       # Password-protected dashboard at /admin
 │   ├── api.js         # Fetches live data from ESPN's free unofficial API
 │   ├── db.js          # Reads and writes to the Cloudflare D1 database
 │   ├── formatter.js   # Turns match data into plain-ASCII GroupMe messages
