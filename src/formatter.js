@@ -78,60 +78,43 @@ export function formatHalfTime(fixture, homeScore, awayScore, stats) {
   return msg;
 }
 
-export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort, shootout, winner) {
+export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort) {
   const label =
     statusShort === "AET" ? "FULL TIME (AET)" :
     statusShort === "PEN" ? "FULL TIME (Penalties)" :
     "FULL TIME";
 
-  // Regulation/ET score is level by definition whenever a match goes to
-  // penalties (that's the entire reason it went to penalties) — so a
-  // PEN result is NEVER a "Draw" overall even when homeScore===awayScore.
-  // We prefer ESPN's own winner:true/false flag (passed in as `winner`,
-  // one of "home"/"away"/"draw"/null) since it's authoritative and
-  // correctly reflects shootout outcomes. Score comparison is only a
-  // fallback for when that flag isn't present in the payload at all.
-  let winnerLine;
-  if (statusShort === "PEN") {
-    if (shootout && (shootout.home != null) && (shootout.away != null)) {
-      winnerLine = shootout.home > shootout.away
-        ? `${fixture.home} win on penalties (${shootout.home}-${shootout.away})`
-        : `${fixture.away} win on penalties (${shootout.away}-${shootout.home})`;
-    } else if (winner === "home") {
-      winnerLine = `${fixture.home} win on penalties`;
-    } else if (winner === "away") {
-      winnerLine = `${fixture.away} win on penalties`;
-    } else {
-      // No shootout score AND no winner flag — we know it went to
-      // penalties but can't confirm who won. Say so rather than guessing.
-      winnerLine = "Decided on penalties";
-    }
-  } else if (winner === "home") {
-    winnerLine = `${fixture.home} win`;
-  } else if (winner === "away") {
-    winnerLine = `${fixture.away} win`;
-  } else if (winner === "draw") {
-    winnerLine = "Draw";
-  } else {
-    // No winner flag in the payload at all — fall back to score
-    // comparison (the old behavior), which is fine for non-PEN results
-    // since the score reliably reflects the outcome outside of shootouts.
-    winnerLine =
-      homeScore > awayScore ? `${fixture.home} win` :
-      awayScore > homeScore ? `${fixture.away} win` :
-      "Draw";
-  }
+  const winner =
+    homeScore > awayScore ? `${fixture.home} win` :
+    awayScore > homeScore ? `${fixture.away} win` :
+    "Draw";
 
   let msg =
     `${label}\n` +
     `${fixture.round}\n` +
     `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}\n` +
-    `${winnerLine}`;
+    `${winner}`;
 
   const statsBlock = formatStatsBlock(stats);
   if (statsBlock) msg += `\n\n${statsBlock}`;
 
   return msg;
+}
+
+/**
+ * Follow-up message used when full-time stats weren't ready yet at the
+ * moment FULL TIME was posted, and arrived later on a retry instead.
+ * Kept as a separate function so the FULL TIME result itself is never
+ * delayed waiting on stats.
+ */
+export function formatFinalStatsFollowUp(fixture, homeScore, awayScore, stats) {
+  const statsBlock = formatStatsBlock(stats);
+  if (!statsBlock) return null;
+  return (
+    `FINAL STATS\n` +
+    `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}\n\n` +
+    `${statsBlock}`
+  );
 }
 
 /**
@@ -180,27 +163,69 @@ export function formatGenericGoal(fixture, homeScore, awayScore) {
 
 /**
  * Build a plain-text stats block from ESPN boxscore.teams data.
- * Returns null if stats aren't available.
+ * Returns null if no stats could be matched at all.
+ *
+ * ESPN's soccer "statistics" entries don't reliably use the same `name`
+ * key across feeds/seasons, but every entry also carries a human-readable
+ * `label` (and often an `abbreviation`). We match against a list of known
+ * aliases per stat against name/label/abbreviation (lowercased, with
+ * non-alphanumeric characters stripped) instead of trusting one exact key.
+ * Any stat with no match on either side is left out of the message
+ * entirely rather than rendered as a placeholder "-" — so the block always
+ * reflects what ESPN actually sent, and silently grows if ESPN adds stats
+ * we haven't aliased yet (we just won't show them) rather than silently
+ * showing wrong/empty values for stats we expected but couldn't find.
  */
 function formatStatsBlock(stats) {
   if (!stats || stats.length < 2) return null;
 
-  const getStat = (teamStats, name) => {
-    const list = teamStats?.statistics || [];
-    return list.find((s) => s.name === name)?.displayValue ?? "-";
-  };
-
   const h = stats.find((t) => t.homeAway === "home") || stats[0];
   const a = stats.find((t) => t.homeAway === "away") || stats[1];
 
-  return (
-    `STATS\n` +
-    `Possession:  ${getStat(h, "possessionPct")} - ${getStat(a, "possessionPct")}\n` +
-    `Shots:       ${getStat(h, "totalShots")} - ${getStat(a, "totalShots")}\n` +
-    `On Target:   ${getStat(h, "shotsOnTarget")} - ${getStat(a, "shotsOnTarget")}\n` +
-    `Corners:     ${getStat(h, "cornerKicks")} - ${getStat(a, "cornerKicks")}\n` +
-    `Fouls:       ${getStat(h, "fouls")} - ${getStat(a, "fouls")}`
-  );
+  const STAT_DEFS = [
+    { label: "Possession",   aliases: ["possessionpct", "possession", "ballpossession", "possession%"] },
+    { label: "Shots",        aliases: ["totalshots", "shotstotal", "shots"] },
+    { label: "On Target",    aliases: ["shotsontarget", "shotsongoal", "ontargetscoringatt", "totalshotsontarget"] },
+    { label: "Corners",      aliases: ["cornerkicks", "wontcorners", "wonCorners".toLowerCase(), "corners", "cornerkicksearned"] },
+    { label: "Fouls",        aliases: ["fouls", "foulscommitted", "foulscommited"] },
+    { label: "Yellow Cards", aliases: ["yellowcards", "totalyellowcards"] },
+    { label: "Red Cards",    aliases: ["redcards", "totalredcards"] },
+    { label: "Offsides",     aliases: ["offsides", "totaloffsides"] },
+  ];
+
+  const rows = [];
+  for (const def of STAT_DEFS) {
+    const hVal = findStat(h, def.aliases);
+    const aVal = findStat(a, def.aliases);
+    if (hVal == null && aVal == null) continue; // not found on either side — skip the row
+    rows.push(`${padLabel(def.label)} ${hVal ?? "-"} - ${aVal ?? "-"}`);
+  }
+
+  if (rows.length === 0) return null;
+  return `STATS\n` + rows.join("\n");
+}
+
+/**
+ * Find a stat's displayValue by matching its `name`, `label`, or
+ * `abbreviation` field (normalized: lowercased, non-alphanumeric stripped)
+ * against a list of known aliases.
+ */
+function findStat(teamStats, aliases) {
+  const list = teamStats?.statistics || [];
+  for (const s of list) {
+    const candidates = [s.name, s.label, s.abbreviation]
+      .filter(Boolean)
+      .map((v) => v.toLowerCase().replace(/[^a-z0-9%]/g, ""));
+    if (candidates.some((c) => aliases.includes(c))) {
+      return s.displayValue ?? null;
+    }
+  }
+  return null;
+}
+
+function padLabel(label) {
+  const width = 13;
+  return (label + ":").padEnd(width, " ");
 }
 
 /**
@@ -238,4 +263,4 @@ function groupByDate(fixtures) {
     acc[date].push(f);
     return acc;
   }, {});
-    }
+                               }
