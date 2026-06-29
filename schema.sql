@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS fixtures (
   round TEXT NOT NULL,
   stage TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'NS',
-  posted_schedule INTEGER NOT NULL DEFAULT 0
+  posted_schedule INTEGER NOT NULL DEFAULT 0,
+  stats_pending INTEGER NOT NULL DEFAULT 0,
+  final_home_score INTEGER,
+  final_away_score INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS seen_events (
