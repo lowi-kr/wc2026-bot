@@ -9,6 +9,13 @@
  *   POST /admin/refresh      — re-fetches today's fixtures from ESPN
  *   POST /admin/reset        — resets a single fixture (status + seen_events)
  *   POST /admin/run          — manually runs an existing job (daily/hourly/live/midnight)
+ *   GET  /admin/data         — JSON snapshot (flags, fixtures, log) polled by
+ *                              the dashboard's own JS for live auto-refresh
+ *
+ * Action forms (override/refresh/reset/run) are progressively enhanced: the
+ * dashboard's inline script submits them via fetch() and re-polls /admin/data
+ * afterward instead of doing a full-page redirect. If JS is disabled, the
+ * plain <form> POST + 302 redirect still works exactly as before.
  *
  * Auth model: a single shared password (env.DASHBOARD_PASSWORD) checked
  * against a cookie holding a signed-ish token (HMAC over a fixed secret +
@@ -55,11 +62,14 @@ export async function handleAdminRequest(request, env, ctx, url, jobFns) {
     return new Response("Unauthorized", { status: 401 });
   }
 
+  if (path === "/admin/data" && request.method === "GET") {
+    return handleData(env);
+  }
   if (path === "/admin/override" && request.method === "POST") {
     return handleOverride(request, env);
   }
   if (path === "/admin/refresh" && request.method === "POST") {
-    return handleRefresh(env);
+    return handleRefresh(request, env);
   }
   if (path === "/admin/reset" && request.method === "POST") {
     return handleReset(request, env);
@@ -165,10 +175,10 @@ async function handleOverride(request, env) {
   await env.KV.put(flag, value, { expirationTtl: 60 * 60 * 26 });
   await logEvent(env.DB, "info", `[manual override] ${flag} set to ${value} via dashboard`);
 
-  return redirectToAdmin();
+  return redirectToAdmin(request);
 }
 
-async function handleRefresh(env) {
+async function handleRefresh(request, env) {
   try {
     const today = utcDate(0);
     const raw = await fetchFixturesByDate(env, today, undefined);
@@ -181,7 +191,7 @@ async function handleRefresh(env) {
   } catch (err) {
     await logEvent(env.DB, "error", `[manual refresh] failed: ${err.message}`);
   }
-  return redirectToAdmin();
+  return redirectToAdmin(request);
 }
 
 async function handleReset(request, env) {
@@ -193,7 +203,7 @@ async function handleReset(request, env) {
   await env.DB.prepare("UPDATE fixtures SET status = 'NS' WHERE id = ?").bind(id).run();
   await logEvent(env.DB, "info", `[manual reset] fixture ${id} reset to NS via dashboard`);
 
-  return redirectToAdmin();
+  return redirectToAdmin(request);
 }
 
 async function handleRun(request, env, ctx, jobFns) {
@@ -215,10 +225,59 @@ async function handleRun(request, env, ctx, jobFns) {
   await logEvent(env.DB, "info", `[manual run] triggered "${job}" via dashboard`);
   await jobs[job]();
 
-  return redirectToAdmin();
+  return redirectToAdmin(request);
 }
 
-function redirectToAdmin() {
+/**
+ * JSON snapshot of everything the dashboard renders, minus the login chrome.
+ * Polled by the dashboard's own inline script every few seconds, and by the
+ * AJAX'd action forms right after they submit, so the page updates itself
+ * without a full reload. Reuses the exact same fragment renderers as the
+ * server-rendered page so the two never drift apart.
+ */
+async function handleData(env) {
+  const today = utcDate(0);
+
+  const [fixturesToday, activeFixtures, gamesToday, gameImminent, logs] = await Promise.all([
+    getFixturesByDate(env.DB, today),
+    getActiveFixtures(env.DB),
+    env.KV.get(KV_GAMES_TODAY),
+    env.KV.get(KV_GAME_IMMINENT),
+    getRecentLogs(env.DB, 100),
+  ]);
+
+  const body = {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    gamesToday,
+    gameImminent,
+    todayFixturesHtml: renderFixturesTable(fixturesToday),
+    hasActive: activeFixtures.length > 0,
+    activeFixturesHtml: renderFixturesTable(activeFixtures),
+    logHtml:
+      logs.length === 0 ? "<p class='hint'>No log entries yet.</p>" : logs.map(renderLogLine).join(""),
+  };
+
+  return new Response(JSON.stringify(body), {
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+  });
+}
+
+/**
+ * Marker header sent by the dashboard's own fetch() calls so handlers can
+ * tell an AJAX'd form submit apart from a plain-HTML fallback POST (e.g. if
+ * the user has JS disabled, or is hitting the endpoint with curl).
+ */
+function isAjax(request) {
+  return request.headers.get("X-Requested-With") === "fetch";
+}
+
+function redirectToAdmin(request) {
+  if (isAjax(request)) {
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
   return new Response(null, { status: 302, headers: { Location: "/admin" } });
 }
 
@@ -275,7 +334,10 @@ async function renderDashboard(env) {
 <body>
   <div class="wrap">
     <header>
-      <h1>WC2026 Bot — Dashboard</h1>
+      <div>
+        <h1>WC2026 Bot — Dashboard</h1>
+        <p class="hint" id="last-updated" style="margin:4px 0 0;">Auto-refreshing every 15s</p>
+      </div>
       <form method="POST" action="/admin/logout"><button class="link-btn" type="submit">Log out</button></form>
     </header>
 
@@ -284,13 +346,13 @@ async function renderDashboard(env) {
       <div class="flags">
         <div class="flag-row">
           <span class="flag-name">games_today</span>
-          <span class="badge ${gamesToday === "1" ? "on" : "off"}">${gamesToday ?? "unset"}</span>
-          <form method="POST" action="/admin/override" class="inline-form">
+          <span class="badge ${gamesToday === "1" ? "on" : "off"}" id="badge-games-today">${gamesToday ?? "unset"}</span>
+          <form method="POST" action="/admin/override" class="inline-form ajax-form">
             <input type="hidden" name="flag" value="${KV_GAMES_TODAY}">
             <input type="hidden" name="value" value="1">
             <button type="submit">Force ON</button>
           </form>
-          <form method="POST" action="/admin/override" class="inline-form">
+          <form method="POST" action="/admin/override" class="inline-form ajax-form">
             <input type="hidden" name="flag" value="${KV_GAMES_TODAY}">
             <input type="hidden" name="value" value="0">
             <button type="submit" class="secondary">Force OFF</button>
@@ -298,13 +360,13 @@ async function renderDashboard(env) {
         </div>
         <div class="flag-row">
           <span class="flag-name">game_imminent</span>
-          <span class="badge ${gameImminent === "1" ? "on" : "off"}">${gameImminent ?? "unset"}</span>
-          <form method="POST" action="/admin/override" class="inline-form">
+          <span class="badge ${gameImminent === "1" ? "on" : "off"}" id="badge-game-imminent">${gameImminent ?? "unset"}</span>
+          <form method="POST" action="/admin/override" class="inline-form ajax-form">
             <input type="hidden" name="flag" value="${KV_GAME_IMMINENT}">
             <input type="hidden" name="value" value="1">
             <button type="submit">Force ON</button>
           </form>
-          <form method="POST" action="/admin/override" class="inline-form">
+          <form method="POST" action="/admin/override" class="inline-form ajax-form">
             <input type="hidden" name="flag" value="${KV_GAME_IMMINENT}">
             <input type="hidden" name="value" value="0">
             <button type="submit" class="secondary">Force OFF</button>
@@ -318,40 +380,39 @@ async function renderDashboard(env) {
 
     <section class="card">
       <h2>Today's fixtures (${escapeHtml(today)})</h2>
-      ${renderFixturesTable(fixturesToday)}
+      <div id="fixtures-today">${renderFixturesTable(fixturesToday)}</div>
     </section>
 
-    ${activeFixtures.length > 0 ? `
-    <section class="card">
+    <section class="card" id="active-section" style="${activeFixtures.length > 0 ? "" : "display:none;"}">
       <h2>Currently active (within polling window)</h2>
-      ${renderFixturesTable(activeFixtures)}
-    </section>` : ""}
+      <div id="active-fixtures-body">${renderFixturesTable(activeFixtures)}</div>
+    </section>
 
     <section class="card">
       <h2>Manual actions</h2>
       <div class="actions">
-        <form method="POST" action="/admin/refresh" class="inline-form">
+        <form method="POST" action="/admin/refresh" class="inline-form ajax-form">
           <button type="submit">Refresh today's fixtures from ESPN</button>
         </form>
-        <form method="POST" action="/admin/run" class="inline-form">
+        <form method="POST" action="/admin/run" class="inline-form ajax-form">
           <input type="hidden" name="job" value="midnight">
           <button type="submit">Run midnight check</button>
         </form>
-        <form method="POST" action="/admin/run" class="inline-form">
+        <form method="POST" action="/admin/run" class="inline-form ajax-form">
           <input type="hidden" name="job" value="hourly">
           <button type="submit">Run hourly check</button>
         </form>
-        <form method="POST" action="/admin/run" class="inline-form">
+        <form method="POST" action="/admin/run" class="inline-form ajax-form">
           <input type="hidden" name="job" value="live">
           <button type="submit">Run live poll now</button>
         </form>
-        <form method="POST" action="/admin/run" class="inline-form">
+        <form method="POST" action="/admin/run" class="inline-form ajax-form">
           <input type="hidden" name="job" value="daily">
           <button type="submit">Post tomorrow's schedule now</button>
         </form>
       </div>
       <h3>Reset a fixture</h3>
-      <form method="POST" action="/admin/reset" class="inline-form">
+      <form method="POST" action="/admin/reset" class="inline-form ajax-form">
         <input type="text" name="id" placeholder="Fixture ID" required>
         <button type="submit" class="secondary">Reset</button>
       </form>
@@ -359,11 +420,12 @@ async function renderDashboard(env) {
 
     <section class="card">
       <h2>Recent activity</h2>
-      <div class="log">
+      <div class="log" id="log-list">
         ${logs.length === 0 ? "<p class='hint'>No log entries yet.</p>" : logs.map(renderLogLine).join("")}
       </div>
     </section>
   </div>
+  <script>${DASHBOARD_JS}</script>
 </body>
 </html>`;
 
@@ -457,4 +519,144 @@ const BASE_CSS = `
   .log-time { color: #6b7280; margin-right: 8px; }
   .log-error { color: #e08a8a; }
   .log-warn { color: #e0c98a; }
+  button:disabled { opacity: 0.6; cursor: default; }
+`;
+
+/**
+ * Dashboard auto-refresh + AJAX action forms. Plain vanilla JS, no build
+ * step — this string is dropped straight into a <script> tag by
+ * renderDashboard(). Polls GET /admin/data on an interval and patches the
+ * DOM in place, so live scores/flags/log update without a manual reload.
+ * Pauses polling while the tab is hidden to avoid burning D1/KV reads for
+ * nothing, and re-fetches immediately when the tab becomes visible again.
+ *
+ * NOTE: this string must not contain any \${...} sequences — it's embedded
+ * inside admin.js's own template literals, which would otherwise try to
+ * interpolate them.
+ */
+const DASHBOARD_JS = `
+(function () {
+  var REFRESH_MS = 15000;
+  var timer = null;
+
+  function setBadge(el, value) {
+    if (!el) return;
+    el.textContent = value === null || value === undefined ? "unset" : value;
+    el.classList.remove("on", "off");
+    el.classList.add(value === "1" ? "on" : "off");
+  }
+
+  function fmtTime(iso) {
+    try {
+      return new Date(iso).toLocaleTimeString("en-US", {
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      });
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function setStamp(text) {
+    var el = document.getElementById("last-updated");
+    if (el) el.textContent = text;
+  }
+
+  function refreshData() {
+    return fetch("/admin/data", { headers: { "X-Requested-With": "fetch" } })
+      .then(function (res) {
+        if (res.status === 401) {
+          window.location.reload();
+          return null;
+        }
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        if (!data) return;
+
+        setBadge(document.getElementById("badge-games-today"), data.gamesToday);
+        setBadge(document.getElementById("badge-game-imminent"), data.gameImminent);
+
+        var fixturesEl = document.getElementById("fixtures-today");
+        if (fixturesEl) fixturesEl.innerHTML = data.todayFixturesHtml;
+
+        var activeSection = document.getElementById("active-section");
+        var activeBody = document.getElementById("active-fixtures-body");
+        if (activeSection && activeBody) {
+          activeBody.innerHTML = data.activeFixturesHtml;
+          activeSection.style.display = data.hasActive ? "" : "none";
+        }
+
+        var logEl = document.getElementById("log-list");
+        if (logEl) logEl.innerHTML = data.logHtml;
+
+        setStamp("Updated " + fmtTime(data.generatedAt));
+      })
+      .catch(function (err) {
+        setStamp("Auto-refresh failed, retrying...");
+        console.error("Dashboard refresh failed:", err);
+      });
+  }
+
+  function startPolling() {
+    stopPolling();
+    timer = setInterval(refreshData, REFRESH_MS);
+  }
+
+  function stopPolling() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      stopPolling();
+    } else {
+      refreshData();
+      startPolling();
+    }
+  });
+
+  var forms = document.querySelectorAll("form.ajax-form");
+  for (var i = 0; i < forms.length; i++) {
+    forms[i].addEventListener("submit", function (e) {
+      e.preventDefault();
+      var form = e.target;
+      var btn = form.querySelector("button");
+      var originalText = btn ? btn.textContent : null;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Working...";
+      }
+      fetch(form.action, {
+        method: "POST",
+        body: new FormData(form),
+        headers: { "X-Requested-With": "fetch" }
+      })
+        .then(function (res) {
+          if (res.status === 401) {
+            window.location.reload();
+            return;
+          }
+          if (!res.ok) {
+            return res.text().then(function (text) {
+              alert("Action failed: " + (text || res.status));
+            });
+          }
+        })
+        .catch(function (err) {
+          alert("Action failed: " + err.message);
+        })
+        .finally(function () {
+          if (btn) {
+            btn.disabled = false;
+            btn.textContent = originalText;
+          }
+          refreshData();
+        });
+    });
+  }
+
+  startPolling();
+})();
 `;
