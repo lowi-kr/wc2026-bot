@@ -33,13 +33,24 @@ export async function getFixturesByDate(db, date) {
 }
 
 /**
- * Get fixtures that are currently active:
- * kicked off in the last 130 minutes and not yet marked FT/AET/PEN.
+ * Get fixtures that are currently active OR about to start:
+ *   - kicked off in the last 130 minutes and not yet marked FT/AET/PEN, OR
+ *   - kicking off within the next `lookaheadMinutes` minutes.
+ *
+ * The lookahead half matters: without it, a fixture that hasn't kicked off
+ * yet is invisible to this query, which means the minute-poll cron's "is
+ * everything done, can I go back to sleep" check (see runMinutePoll in
+ * index.js) sees an empty result and concludes there's nothing to do —
+ * even when a kickoff the hourly check correctly flagged as imminent is
+ * only minutes away. That mismatch caused the bot to clear game_imminent
+ * one minute after setting it and sleep right through an actual kickoff.
+ * Defaults to 70 minutes to match runHourlyCheck's own lookahead window,
+ * so the two checks can never disagree about what counts as "imminent".
  */
-export async function getActiveFixtures(db) {
+export async function getActiveFixtures(db, lookaheadMinutes = 70) {
   const now = Date.now();
   const windowStart = new Date(now - 130 * 60 * 1000).toISOString();
-  const windowEnd = new Date(now).toISOString();
+  const windowEnd = new Date(now + lookaheadMinutes * 60 * 1000).toISOString();
   const { results } = await db
     .prepare(
       `SELECT * FROM fixtures
@@ -230,4 +241,4 @@ export async function trimEventLog(db, keep = 500) {
     )
     .bind(keep)
     .run();
-    }
+}

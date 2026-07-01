@@ -164,9 +164,7 @@ export function formatFinalStatsFollowUp(fixture, homeScore, awayScore, stats) {
  * Only goals are posted live (no commentary source for cards/subs yet).
  */
 export function formatEvent(play, fixture, homeScore, awayScore) {
-  const typeText = (play.type?.text || "").toLowerCase();
-  if (!typeText.includes("goal")) return null; // Only goals, by design
-
+  // scoringPlay===true is the entry condition — we only call this for real goals.
   const min   = play.clock?.displayValue || "?'";
   const team  = play.team?.displayName || "";
   const score = `${homeScore}-${awayScore}`;
@@ -177,8 +175,10 @@ export function formatEvent(play, fixture, homeScore, awayScore) {
   // Fall back to ESPN's own description text if participant data is missing
   const name = scorer || extractNameFromText(play.text) || "Goal";
 
-  const isOG      = typeText.includes("own");
-  const isPenalty = typeText.includes("penalty");
+  // p.ownGoal and p.penaltyKick are confirmed boolean fields on ESPN play
+  // objects (verified from live WC2026 data 2026-06-29).
+  const isOG      = play.ownGoal === true;
+  const isPenalty = play.penaltyKick === true;
 
   if (isOG) {
     return `${min} OWN GOAL - ${name}${team ? ` (${team})` : ""}\n${fixture.home} ${score} ${fixture.away}`;

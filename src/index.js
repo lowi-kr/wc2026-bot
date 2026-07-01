@@ -329,24 +329,24 @@ async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
     return;
   }
 
-  const goalPlays = (plays || []).filter((p) =>
-    (p.type?.text || "").toLowerCase().includes("goal")
-  );
+  // Filter to actual scoring plays using ESPN's confirmed boolean field.
+  // IMPORTANT: .includes("goal") on type.text is WRONG — "Goal Kick" has
+  // type.text="Goal Kick" and matches, flooding goalPlays with routine
+  // restarts that happen many times per half. This was the real root cause
+  // of the stale/wrong goal minute: goalPlays[length-1] kept returning the
+  // most recent Goal Kick, not the actual goal. scoringPlay===true is the
+  // confirmed correct filter (verified from a live ESPN play object for
+  // this tournament: Goal Kick has scoringPlay=false, confirmed 2026-06-29).
+  const goalPlays = (plays || []).filter((p) => p.scoringPlay === true);
 
-  // One-time diagnostic: capture the raw shape of a goal play so the actual
-  // ESPN field names for a play's running score can be confirmed (see the
-  // findGoalMatchingScore guesses below). Logs once per fixture, then never
-  // again — won't spam event_log across the rest of the match.
-  await logRawShapeOnce(env, `goal_play_shape_${dbFixture.id}`, "goal_play", goalPlays[0] || plays[0]);
+  // One-time diagnostic re-keyed as _v2 so it captures a real *scoring*
+  // play — the _v1 capture earlier in this match grabbed a Goal Kick instead
+  // (because the old filter was wrong). This fires once on the next goal.
+  await logRawShapeOnce(env, `goal_play_shape_v2_${dbFixture.id}`, "goal_play", goalPlays[0] || plays[0]);
 
-  // IMPORTANT: don't assume the *last* goal play in the array is the one
-  // that produced the *current* scoreboard score — ESPN's /plays feed and
-  // the scoreboard score can be a poll or two out of sync with each other,
-  // which is what caused the same goal minute to repeat on a later goal.
-  // Instead, find the goal play whose own running score actually matches
-  // homeScore/awayScore. Fall back to position-based matching only if no
-  // play's own score lines up, and fall back further to a generic message
-  // (no stale minute) if the feed looks behind by count.
+  // Find the scoring play whose homeScore/awayScore fields match the current
+  // scoreboard. p.homeScore and p.awayScore are confirmed present on every
+  // ESPN play object (verified from live data 2026-06-29).
   const matchingGoal = findGoalMatchingScore(goalPlays, homeScore, awayScore);
   const latestGoal    = matchingGoal || goalPlays[goalPlays.length - 1];
 
@@ -363,22 +363,15 @@ async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
 }
 
 /**
- * Look through goalPlays for the one whose own recorded score matches the
- * scoreboard's current homeScore/awayScore. ESPN's play objects sometimes
- * carry the post-goal score under different keys depending on the feed
- * version, so we check a few plausible shapes. Unverified against a live
- * response as of this writing — see logRawShapeOnce above, which captures
- * a real goal play the next time one happens so these can be confirmed.
+ * Find the scoring play whose post-goal score matches the current scoreboard.
+ * p.homeScore and p.awayScore are confirmed present on ESPN play objects
+ * (verified from live WC2026 data 2026-06-29).
  */
 function findGoalMatchingScore(goalPlays, homeScore, awayScore) {
   for (let i = goalPlays.length - 1; i >= 0; i--) {
     const p = goalPlays[i];
-    const playHome = p.homeScore ?? p.scoreValue?.home ?? p.team?.score?.home;
-    const playAway = p.awayScore ?? p.scoreValue?.away ?? p.team?.score?.away;
-    if (playHome != null && playAway != null) {
-      if (parseInt(playHome, 10) === homeScore && parseInt(playAway, 10) === awayScore) {
-        return p;
-      }
+    if (parseInt(p.homeScore, 10) === homeScore && parseInt(p.awayScore, 10) === awayScore) {
+      return p;
     }
   }
   return null;
