@@ -746,7 +746,7 @@ async function routeCommand(env, text) {
   if ((match = lower.match(/^goals\b\s*(.*)$/))) {
     return handleGoalsCommand(env, match[1].trim());
   }
-  if (lower === "help" || lower === "commands") {
+  if (lower === "!help" || lower === "commands") {
     return postToGroupMe(env, formatCommandHelp());
   }
   // Not a recognized command — say nothing.
