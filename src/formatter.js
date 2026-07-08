@@ -64,6 +64,33 @@ export function formatKickoff(fixture) {
   );
 }
 
+export function formatSecondHalfKickoff(fixture, homeScore, awayScore) {
+  return (
+    `SECOND HALF UNDERWAY\n` +
+    `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`
+  );
+}
+
+/**
+ * Announce an extra-time / shootout phase transition.
+ * `phase` is one of: "et_first_half", "et_halftime", "et_second_half", "shootout".
+ */
+export function formatPhaseTransition(phase, fixture, homeScore, awayScore) {
+  const score = `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`;
+  switch (phase) {
+    case "et_first_half":
+      return `EXTRA TIME\n${fixture.round}\n${score}\nExtra time begins`;
+    case "et_halftime":
+      return `HALF TIME (Extra Time)\n${score}`;
+    case "et_second_half":
+      return `EXTRA TIME - SECOND HALF\n${score}`;
+    case "shootout":
+      return `PENALTY SHOOTOUT\n${fixture.home} vs ${fixture.away}\nScore after extra time: ${homeScore}-${awayScore}`;
+    default:
+      return null;
+  }
+}
+
 /**
  * Half-time message, optionally with stats if available.
  */
@@ -201,6 +228,98 @@ export function formatGenericGoal(fixture, homeScore, awayScore) {
   return `GOAL\n${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`;
 }
 
+// ─── Chat Command Replies ─────────────────────────────────────────────────────
+
+/**
+ * Reply to the "live" command. `liveInfo` is whatever getCurrentScore()
+ * in index.js resolved: { homeScore, awayScore, statusDetail, clock }.
+ */
+export function formatLiveReply(fixture, liveInfo) {
+  const { homeScore, awayScore, statusDetail, clock } = liveInfo || {};
+  const scoreLine = `${fixture.home} ${homeScore ?? "?"}-${awayScore ?? "?"} ${fixture.away}`;
+  const detailLine = [clock, statusDetail].filter(Boolean).join(" - ");
+  return `LIVE\n${scoreLine}${detailLine ? `\n${detailLine}` : ""}`;
+}
+
+/**
+ * Reply to the "live" command for a match that's already finished.
+ */
+export function formatFinishedReply(fixture) {
+  const label =
+    fixture.status === "AET" ? "FULL TIME (AET)" :
+    fixture.status === "PEN" ? "FULL TIME (Penalties)" :
+    "FULL TIME";
+  const h = fixture.final_home_score;
+  const a = fixture.final_away_score;
+  return `${label}\n${fixture.home} ${h ?? "?"}-${a ?? "?"} ${fixture.away}`;
+}
+
+/**
+ * Reply to the "stats" command.
+ */
+export function formatStatsReply(fixture, homeScore, awayScore, stats) {
+  const header = ["FT", "AET", "PEN"].includes(fixture.status) ? "FULL TIME" : "STATS";
+  const statsBlock = formatStatsBlock(stats);
+  let msg = `${header}\n${fixture.home} ${homeScore ?? "?"}-${awayScore ?? "?"} ${fixture.away}`;
+  if (statsBlock) {
+    msg += `\n\n${statsBlock}`;
+  } else {
+    msg += `\n\nNo stats available yet for this match.`;
+  }
+  return msg;
+}
+
+/**
+ * Reply to the "goals" command — one line per goal, in order.
+ * `goalPlays` are raw ESPN play objects already filtered to scoringPlay===true.
+ */
+export function formatGoalsReply(fixture, goalPlays) {
+  if (!goalPlays || goalPlays.length === 0) {
+    return `GOALS\n${fixture.home} vs ${fixture.away}\nNo goals yet.`;
+  }
+
+  const lines = [`GOALS\n${fixture.home} vs ${fixture.away}`];
+  for (const play of goalPlays) {
+    const min = play.clock?.displayValue || "?'";
+    const team = play.team?.displayName || "";
+    const scorer = play.participants?.find((p) => p.type?.text === "Scorer")?.athlete?.displayName;
+    const name = scorer || extractNameFromText(play.text) || "Goal";
+    const tag = play.ownGoal === true ? " (OG)" : play.penaltyKick === true ? " (PEN)" : "";
+    lines.push(`${min} ${name}${tag}${team ? ` - ${team}` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Reply when a search term matches no fixture, or nothing is live/recent.
+ */
+export function formatNoMatchReply(term) {
+  return term
+    ? `No match found for "${term}".`
+    : `No match is live right now, and I couldn't find a recent one.`;
+}
+
+/**
+ * Reply when more than one match is live and a command needs a team name
+ * to disambiguate.
+ */
+export function formatAmbiguousReply(candidates, commandHint) {
+  const list = candidates.map((f) => `${f.home} vs ${f.away}`).join(", ");
+  return `Multiple matches live right now: ${list}\nTry "${commandHint} <team name>" to pick one.`;
+}
+
+export function formatCommandHelp() {
+  return (
+    `BOT COMMANDS\n` +
+    `live          - score/status of the live match(es)\n` +
+    `live <team>   - status of a specific match\n` +
+    `stats         - stats for the active or most recent match\n` +
+    `stats <team>  - stats for a specific match\n` +
+    `goals         - goals so far in the active or most recent match\n` +
+    `goals <team>  - goals for a specific match`
+  );
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -218,7 +337,7 @@ export function formatGenericGoal(fixture, homeScore, awayScore) {
  * no match on either side is left out of the message entirely rather than
  * rendered as a placeholder "-".
  */
-function formatStatsBlock(stats) {
+export function formatStatsBlock(stats) {
   if (!stats || stats.length < 2) return null;
 
   const h = stats.find((t) => t.homeAway === "home") || stats[0];
