@@ -12,11 +12,12 @@
 
 import { fetchFixturesInRange, fetchFixturesByDate, fetchLiveFixtures, fetchEvents, fetchStats, ESPN_STATUS } from "./api.js";
 import { postToGroupMe } from "./groupme.js";
-import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatHalfTime, formatFullTime, formatFinalStatsFollowUp, formatEvent, formatGenericGoal } from "./formatter.js";
+import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatSecondHalfKickoff, formatHalfTime, formatFullTime, formatFinalStatsFollowUp, formatEvent, formatGenericGoal, formatPhaseTransition, formatLiveReply, formatFinishedReply, formatStatsReply, formatGoalsReply, formatNoMatchReply, formatAmbiguousReply, formatCommandHelp } from "./formatter.js";
 import {
   upsertFixtures, getFixturesByDate, getActiveFixtures, getFixturesPendingStats,
   updateFixtureStatus, markStatsPending, clearStatsPending, setFinalScore,
   getSeenEvents, insertSeenEvent, getState, setState,
+  findFixtureByTeam, getCurrentlyLiveFixtures, getMostRecentFinishedFixture,
   logEvent, getRecentLogs, trimEventLog,
 } from "./db.js";
 import { handleAdminRequest } from "./admin.js";
@@ -79,6 +80,12 @@ export default {
 
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
       return handleAdminRequest(request, env, ctx, url, JOB_FNS);
+    }
+
+    if (request.method === "POST" && url.pathname === "/groupme-webhook") {
+      // GroupMe expects a fast 2xx ack; do the actual work in the background.
+      ctx.waitUntil(handleGroupMeCallback(env, request));
+      return new Response("ok");
     }
 
     if (action === "init") {
@@ -161,7 +168,13 @@ async function runMidnightCheck(env) {
 
 // ─── Hourly Check ─────────────────────────────────────────────────────────────
 // Runs every hour. Only does work if games_today=1.
-// Checks if any fixture kicks off within the next 70 minutes.
+// Asks ESPN directly whether anything is live or about to kick off — this is
+// deliberately NOT based on D1's cached kickoff_utc/status. A cached kickoff
+// time can drift (we found one off by an hour), and a wall-clock cutoff based
+// on it can end tracking mid-match. ESPN's own `state` stays "in" for the
+// entire match — regulation, halftime, extra time, stoppage, penalties — and
+// only flips to "post" once it's actually over, so trusting it directly here
+// removes the guesswork entirely.
 
 async function runHourlyCheck(env) {
   const gamesToday = await env.KV.get(KV_GAMES_TODAY);
@@ -170,25 +183,35 @@ async function runHourlyCheck(env) {
     return;
   }
 
-  const today    = utcDate(0);
-  const fixtures = await getFixturesByDate(env.DB, today);
-  const now      = Date.now();
+  const today = utcDate(0);
+  let espnFixtures;
+  try {
+    espnFixtures = await fetchFixturesByDate(env, today, undefined);
+  } catch (err) {
+    // Transient ESPN error — do NOT clear game_imminent on a fetch failure.
+    // Leaving the existing KV value in place is the fail-safe choice: worst
+    // case we poll one extra hour we didn't need to, instead of silently
+    // dropping a live match because ESPN hiccuped for one request.
+    console.error("Hourly check: failed to fetch ESPN scoreboard:", err);
+    await logEvent(env.DB, "error", `[hourly] failed to fetch ESPN scoreboard, leaving game_imminent unchanged: ${err.message}`);
+    return;
+  }
 
-  // A game is "imminent" if it kicks off within the next 70 minutes
-  // OR if it's already in progress (kickoff was in the last 120 minutes and not FT)
-  const imminent = fixtures.some((f) => {
+  const relevant = today <= GROUP_STAGE_END ? filterFixtures(espnFixtures, "group") : espnFixtures;
+  const now = Date.now();
+
+  const imminent = relevant.some((f) => {
+    if (f.espn_status === ESPN_STATUS.IN) return true; // live right now, per ESPN — covers HT/ET/stoppage/shootout
     const kickoff = new Date(f.kickoff_utc).getTime();
-    const minsUntil  = (kickoff - now) / 60000;
-    const minsAgo    = (now - kickoff) / 60000;
-    const notFinished = !["FT", "AET", "PEN"].includes(f.status);
-    return (minsUntil >= 0 && minsUntil <= 70) || (minsAgo >= 0 && minsAgo <= 120 && notFinished);
+    const minsUntil = (kickoff - now) / 60000;
+    return minsUntil >= 0 && minsUntil <= 70; // about to start
   });
 
   await env.KV.put(KV_GAME_IMMINENT, imminent ? "1" : "0", {
     expirationTtl: 60 * 60 * 2,
   });
-  console.log(`Hourly check: game_imminent=${imminent}`);
-  await logEvent(env.DB, "info", `[hourly] game_imminent=${imminent}`);
+  console.log(`Hourly check: game_imminent=${imminent} (source: ESPN live scoreboard)`);
+  await logEvent(env.DB, "info", `[hourly] game_imminent=${imminent} (source: ESPN live scoreboard)`);
 }
 
 // ─── Minute Poll ──────────────────────────────────────────────────────────────
@@ -242,11 +265,13 @@ async function runLivePolling(env) {
 }
 
 async function processLiveFixture(env, dbFixture, espnEvent) {
-  const comp       = espnEvent.competitions?.[0];
-  const statusType = comp?.status?.type;
-  const state      = statusType?.state;
-  const statusName = statusType?.name || "";
-  const prevStatus = dbFixture.status;
+  const comp        = espnEvent.competitions?.[0];
+  const statusType  = comp?.status?.type;
+  const state       = statusType?.state;
+  const statusName  = statusType?.name || "";
+  const statusDetail = statusType?.detail || statusType?.description || statusType?.shortDetail || "";
+  const period      = comp?.status?.period ?? null;
+  const prevStatus  = dbFixture.status;
 
   const home      = comp?.competitors?.find((c) => c.homeAway === "home");
   const away      = comp?.competitors?.find((c) => c.homeAway === "away");
@@ -283,7 +308,16 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
 
   // Second half resumes after HT
   if (prevStatus === "HT" && state === ESPN_STATUS.IN && statusName !== "STATUS_HALFTIME") {
+    await postToGroupMe(env, formatSecondHalfKickoff(dbFixture, homeScore, awayScore));
     await updateFixtureStatus(env.DB, dbFixture.id, "LIVE");
+    await logEvent(env.DB, "info", `[live] second-half kickoff posted: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away}`);
+  }
+
+  // Extra time / shootout phase transitions (kickoff of ET, ET half-time,
+  // second ET half, shootout start). Best-effort: see checkExtraTimePhases
+  // for why the detection here is defensive rather than exact-string-match.
+  if (state === ESPN_STATUS.IN) {
+    await checkExtraTimePhases(env, dbFixture, statusName, statusDetail, period, homeScore, awayScore);
   }
 
   // Full time
@@ -296,6 +330,57 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
   // Live events during play — pass current score from scoreboard
   if (state === ESPN_STATUS.IN && statusName !== "STATUS_HALFTIME") {
     await pollAndPostEvents(env, dbFixture, homeScore, awayScore);
+  }
+}
+
+/**
+ * Detect and announce extra-time / penalty-shootout phase transitions.
+ *
+ * IMPORTANT CAVEAT: unlike goal detection (which we've verified against real
+ * live matches), ESPN's exact status.type.name / detail strings for extra
+ * time and shootouts in this competition are NOT independently confirmed —
+ * no match had reached extra time at the time this was written. Rather than
+ * hardcode one guessed string and risk silently missing the transition
+ * entirely (the same failure mode as the goal-detection bug), this checks
+ * several defensive signals (name, free-text detail, period number) at once.
+ * The raw status shape is logged the first time any of them fire, via the
+ * same one-shot diagnostic pattern used for stats shapes, so the detection
+ * can be tightened against real data the moment it's actually exercised.
+ */
+async function checkExtraTimePhases(env, dbFixture, statusName, statusDetail, period, homeScore, awayScore) {
+  const name   = (statusName || "").toUpperCase();
+  const detail = (statusDetail || "").toLowerCase();
+
+  const looksShootout = name.includes("SHOOTOUT") || detail.includes("shootout") || detail.includes("penalty shoot");
+  const looksExtra    = !looksShootout && (
+    name.includes("EXTRA") || name.includes("_ET") ||
+    detail.includes("extra time") ||
+    (typeof period === "number" && period >= 3)
+  );
+
+  let phase = null;
+  if (looksShootout) {
+    phase = "shootout";
+  } else if (looksExtra) {
+    const looksHalftime = name.includes("HALFTIME") || detail.includes("half-time") || detail.includes("halftime");
+    if (looksHalftime) phase = "et_halftime";
+    else if (typeof period === "number" && period >= 4) phase = "et_second_half";
+    else phase = "et_first_half";
+  }
+
+  if (!phase) return;
+
+  const key  = `extra_phase_${dbFixture.id}`;
+  const last = await getState(env.DB, key);
+  if (last === phase) return; // already announced this phase
+  await setState(env.DB, key, phase);
+
+  await logRawShapeOnce(env, `extra_time_shape_${dbFixture.id}`, "status_object", { statusName, statusDetail, period });
+
+  const msg = formatPhaseTransition(phase, dbFixture, homeScore, awayScore);
+  if (msg) {
+    await postToGroupMe(env, msg);
+    await logEvent(env.DB, "info", `[live] phase transition posted: ${phase} for fixture ${dbFixture.id} (${dbFixture.home} vs ${dbFixture.away})`);
   }
 }
 
@@ -533,9 +618,13 @@ async function logRawShapeOnce(env, stateKey, label, payload) {
 
 async function checkIfFinished(env, dbFixture) {
   try {
-    const today    = utcDate(0);
-    const fixtures = await fetchFixturesByDate(env, today, dbFixture.stage);
-    const match    = fixtures.find((f) => f.id === dbFixture.id);
+    // Use the fixture's OWN kickoff date, not "today" — if this runs after
+    // the fixture's UTC calendar day has rolled over (common for late-night
+    // kickoffs), querying "today" would never find the match again and this
+    // fixture would stay stuck as "active" forever.
+    const fixtureDate = dbFixture.kickoff_utc.split("T")[0];
+    const fixtures    = await fetchFixturesByDate(env, fixtureDate, dbFixture.stage);
+    const match       = fixtures.find((f) => f.id === dbFixture.id);
     if (!match) return;
     if (match.espn_status === ESPN_STATUS.POST) {
       await updateFixtureStatus(env.DB, dbFixture.id, "FT");
@@ -602,6 +691,168 @@ async function runDailyJob(env, force = false) {
   await setState(env.DB, stateKey, "1");
   console.log(`Daily schedule posted for ${tomorrow}: ${fixtures.length} fixtures.`);
   await logEvent(env.DB, "info", `[daily] schedule posted for ${tomorrow}: ${fixtures.length} fixture(s)`);
+}
+
+// ─── Chat Commands ────────────────────────────────────────────────────────────
+// Requires the GroupMe bot's "Callback URL" (set in dev.groupme.com) to point
+// at this worker's /groupme-webhook path — see README for setup. Without a
+// callback URL configured, GroupMe never calls this, and the bot behaves
+// exactly as before (posts only, no listening).
+
+/**
+ * Entry point for GroupMe's message callback. GroupMe posts here for every
+ * message sent in the group, including the bot's own — we filter those out
+ * to avoid a feedback loop, then hand recognized commands off to a handler.
+ * Unrecognized text is ignored silently so the bot doesn't spam the group
+ * in response to ordinary conversation.
+ */
+async function handleGroupMeCallback(env, request) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return; // not valid JSON — ignore
+  }
+
+  // Ignore the bot's own posts and any system messages (joins/leaves/etc.)
+  if (!body || body.sender_type !== "user" || body.system) return;
+
+  const text = (body.text || "").trim();
+  if (!text) return;
+
+  try {
+    await routeCommand(env, text);
+  } catch (err) {
+    console.error(`Command handling error for "${text}":`, err);
+    await logEvent(env.DB, "error", `[command] error handling "${text}": ${err.message}`);
+  }
+}
+
+/**
+ * Matches the message against known commands. Anchored at the start of the
+ * message (not "contains") so ordinary chat mentioning these words in a
+ * sentence ("I live in Boston") doesn't accidentally trigger a reply.
+ */
+async function routeCommand(env, text) {
+  const lower = text.trim().toLowerCase();
+  let match;
+
+  if ((match = lower.match(/^live\b\s*(.*)$/))) {
+    return handleLiveCommand(env, match[1].trim());
+  }
+  if ((match = lower.match(/^stats\b\s*(.*)$/))) {
+    return handleStatsCommand(env, match[1].trim());
+  }
+  if ((match = lower.match(/^goals\b\s*(.*)$/))) {
+    return handleGoalsCommand(env, match[1].trim());
+  }
+  if (lower === "help" || lower === "commands") {
+    return postToGroupMe(env, formatCommandHelp());
+  }
+  // Not a recognized command — say nothing.
+}
+
+/**
+ * Resolve which fixture a command should act on:
+ *   - a search term given -> best matching fixture (active preferred over finished)
+ *   - no term, exactly one live match -> that match
+ *   - no term, multiple live matches -> ambiguous, let the caller ask for a team name
+ *   - no term, nothing live -> most recently finished match
+ */
+async function resolveTargetFixture(env, term) {
+  if (term) {
+    const fixture = await findFixtureByTeam(env.DB, term);
+    return { fixture, ambiguous: false };
+  }
+  const live = await getCurrentlyLiveFixtures(env.DB);
+  if (live.length === 1) return { fixture: live[0], ambiguous: false };
+  if (live.length > 1) return { fixture: null, ambiguous: true, candidates: live };
+  const recent = await getMostRecentFinishedFixture(env.DB);
+  return { fixture: recent, ambiguous: false };
+}
+
+/**
+ * Get the current score (and, if live, status detail/clock) for a fixture.
+ * For finished fixtures this reads the stored final score from D1. For
+ * anything still in progress, it asks ESPN directly rather than trusting
+ * any score cached in D1 — the live scoreboard is the only place with an
+ * up-to-the-minute score and clock.
+ */
+async function getCurrentScore(env, fixture) {
+  if (["FT", "AET", "PEN"].includes(fixture.status)) {
+    return { homeScore: fixture.final_home_score, awayScore: fixture.final_away_score };
+  }
+  try {
+    const live = await fetchLiveFixtures(env);
+    const espnEvent = live.find((e) => parseInt(e.id, 10) === fixture.id);
+    const comp = espnEvent?.competitions?.[0];
+    const home = comp?.competitors?.find((c) => c.homeAway === "home");
+    const away = comp?.competitors?.find((c) => c.homeAway === "away");
+    const statusType = comp?.status?.type;
+    return {
+      homeScore: parseInt(home?.score || "0", 10),
+      awayScore: parseInt(away?.score || "0", 10),
+      statusDetail: statusType?.detail || statusType?.description || statusType?.shortDetail || "",
+      clock: comp?.status?.displayClock || "",
+    };
+  } catch (err) {
+    await logEvent(env.DB, "warn", `[command] live score fetch failed for fixture ${fixture.id}: ${err.message}`);
+    return { homeScore: null, awayScore: null };
+  }
+}
+
+async function handleLiveCommand(env, term) {
+  const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
+  if (ambiguous) {
+    return postToGroupMe(env, formatAmbiguousReply(candidates, "live"));
+  }
+  if (!fixture) {
+    return postToGroupMe(env, formatNoMatchReply(term));
+  }
+  if (["FT", "AET", "PEN"].includes(fixture.status)) {
+    return postToGroupMe(env, formatFinishedReply(fixture));
+  }
+  const liveInfo = await getCurrentScore(env, fixture);
+  await postToGroupMe(env, formatLiveReply(fixture, liveInfo));
+}
+
+async function handleStatsCommand(env, term) {
+  const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
+  if (ambiguous) {
+    return postToGroupMe(env, formatAmbiguousReply(candidates, "stats"));
+  }
+  if (!fixture) {
+    return postToGroupMe(env, formatNoMatchReply(term));
+  }
+
+  const score = await getCurrentScore(env, fixture);
+  let stats = null;
+  try {
+    stats = await fetchStats(env, fixture.id);
+  } catch (err) {
+    await logEvent(env.DB, "warn", `[command] stats fetch failed for fixture ${fixture.id}: ${err.message}`);
+  }
+  await postToGroupMe(env, formatStatsReply(fixture, score.homeScore, score.awayScore, stats));
+}
+
+async function handleGoalsCommand(env, term) {
+  const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
+  if (ambiguous) {
+    return postToGroupMe(env, formatAmbiguousReply(candidates, "goals"));
+  }
+  if (!fixture) {
+    return postToGroupMe(env, formatNoMatchReply(term));
+  }
+
+  let plays;
+  try {
+    plays = await fetchEvents(env, fixture.id);
+  } catch (err) {
+    await logEvent(env.DB, "warn", `[command] goals fetch failed for fixture ${fixture.id}: ${err.message}`);
+    return postToGroupMe(env, `Couldn't fetch goal data for ${fixture.home} vs ${fixture.away} right now — try again shortly.`);
+  }
+  const goalPlays = (plays || []).filter((p) => p.scoringPlay === true);
+  await postToGroupMe(env, formatGoalsReply(fixture, goalPlays));
 }
 
 // ─── Country Filter ───────────────────────────────────────────────────────────
