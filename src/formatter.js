@@ -291,6 +291,136 @@ export function formatGoalsReply(fixture, goalPlays) {
 }
 
 /**
+ * Reply to the "cards" command — yellow/red cards in match order.
+ * `cardPlays` are raw ESPN play objects already filtered to
+ * yellowCard===true || redCard===true.
+ */
+export function formatCardsReply(fixture, cardPlays) {
+  if (!cardPlays || cardPlays.length === 0) {
+    return `CARDS\n${fixture.home} vs ${fixture.away}\nNo cards yet.`;
+  }
+  const lines = [`CARDS\n${fixture.home} vs ${fixture.away}`];
+  for (const play of cardPlays) {
+    const min = play.clock?.displayValue || "?'";
+    const team = play.team?.displayName || "";
+    const player = play.participants?.[0]?.athlete?.displayName || extractNameFromText(play.text) || "Unknown";
+    const kind = play.redCard === true ? "RED" : "YELLOW";
+    lines.push(`${min} ${kind} - ${player}${team ? ` (${team})` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Reply to the "subs" command — substitutions in match order.
+ * `subPlays` are raw ESPN play objects already filtered to substitution===true.
+ */
+export function formatSubsReply(fixture, subPlays) {
+  if (!subPlays || subPlays.length === 0) {
+    return `SUBSTITUTIONS\n${fixture.home} vs ${fixture.away}\nNone yet.`;
+  }
+  const lines = [`SUBSTITUTIONS\n${fixture.home} vs ${fixture.away}`];
+  for (const play of subPlays) {
+    const min = play.clock?.displayValue || "?'";
+    const team = play.team?.displayName || "";
+    const inPlayer = play.participants?.find((p) => p.type?.text === "SubstituteIn")?.athlete?.displayName;
+    const outPlayer = play.participants?.find((p) => p.type?.text === "SubstituteOut")?.athlete?.displayName;
+    const desc = inPlayer && outPlayer ? `${inPlayer} on for ${outPlayer}` : (play.text || "Substitution");
+    lines.push(`${min} ${desc}${team ? ` (${team})` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Reply to the "next"/"next <team>" command.
+ */
+export function formatNextReply(fixtures, term) {
+  if (!fixtures || fixtures.length === 0) {
+    return term ? `No upcoming fixture found for "${term}".` : `No upcoming fixtures scheduled.`;
+  }
+  const header = term ? `NEXT - ${term}` : `NEXT UP`;
+  const lines = [header];
+  for (const f of fixtures) {
+    lines.push(`${f.home} vs ${f.away}`);
+    lines.push(`   ${kickoffET(f.kickoff_utc)} | ${f.round}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Reply to the "today" command — thin wrapper around the existing daily
+ * schedule formatter so the wording matches what's already posted at 8AM.
+ */
+export function formatTodayReply(fixtures) {
+  return formatDailySchedule(fixtures, "Today");
+}
+
+/**
+ * Reply to "!admin status" — quick health snapshot without the dashboard.
+ */
+export function formatStatusReply({ gamesToday, gameImminent, statusCounts, muted }) {
+  const counts = (statusCounts || []).map((r) => `  ${r.status}: ${r.cnt}`).join("\n") || "  (none)";
+  return (
+    `BOT STATUS\n` +
+    `games_today:    ${gamesToday}\n` +
+    `game_imminent:  ${gameImminent}\n` +
+    `muted:          ${muted ? "yes" : "no"}\n\n` +
+    `Fixtures by status:\n${counts}`
+  );
+}
+
+/**
+ * Reply to "!admin fixtures [date]" — a plain-text fixture list, the text
+ * alternative to browsing the admin dashboard.
+ */
+export function formatAdminFixtureList(fixtures, label) {
+  if (!fixtures || fixtures.length === 0) {
+    return `${label}: no fixtures found.`;
+  }
+  const lines = [`${label} (${fixtures.length}):`];
+  for (const f of fixtures) {
+    lines.push(`  [${f.id}] ${f.home} vs ${f.away} - ${f.status} - ${kickoffET(f.kickoff_utc)}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Reply to "!admin refresh".
+ */
+export function formatRefreshReply(count, date) {
+  return `Refreshed ${date} from ESPN: ${count} fixture(s) upserted.`;
+}
+
+/**
+ * Reply to "!admin reconcile".
+ */
+export function formatReconcileReply(results) {
+  if (!results || results.length === 0) {
+    return `Nothing to reconcile — no stuck fixtures found.`;
+  }
+  const lines = [`RECONCILE (${results.length} fixture(s)):`];
+  for (const r of results) {
+    lines.push(`  [${r.id}] ${r.home} vs ${r.away}: ${r.before} -> ${r.after}${r.note ? ` (${r.note})` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Reply to "!admin follow <team>" / "!admin unfollow <team>".
+ */
+export function formatFollowReply(action, team, list) {
+  const listLine = list.length ? list.join(", ") : "(none)";
+  return `${action === "add" ? "Added" : "Removed"} "${team}". Current overrides: ${listLine}`;
+}
+
+/**
+ * Reply to "!admin mute <minutes>" / "!admin unmute".
+ */
+export function formatMuteReply(minutes) {
+  if (minutes == null) return `Unmuted — automated live posts will resume immediately.`;
+  return `Muted for ${minutes} minute(s) — automated live posts (kickoff/goal/HT/FT) are paused. Commands still work.`;
+}
+
+/**
  * Reply when a search term matches no fixture, or nothing is live/recent.
  */
 export function formatNoMatchReply(term) {
@@ -304,20 +434,46 @@ export function formatNoMatchReply(term) {
  * to disambiguate.
  */
 export function formatAmbiguousReply(candidates, commandHint) {
-  const list = candidates.map((f) => `${f.home} vs ${f.away}`).join(", ");
-  return `Multiple matches live right now: ${list}\nTry "${commandHint} <team name>" to pick one.`;
+  const MAX_LISTED = 8;
+  const shown = candidates.slice(0, MAX_LISTED).map((f) => `  ${f.home} vs ${f.away}`);
+  const extra = candidates.length - shown.length;
+  const lines = [`Multiple matches live right now:`, ...shown];
+  if (extra > 0) lines.push(`  ...and ${extra} more`);
+  lines.push(`Try "${commandHint} <team name>" to pick one.`);
+  return lines.join("\n");
 }
 
-export function formatCommandHelp() {
-  return (
+export function formatCommandHelp(isAdmin = false) {
+  let msg =
     `BOT COMMANDS\n` +
     `live          - score/status of the live match(es)\n` +
     `live <team>   - status of a specific match\n` +
     `stats         - stats for the active or most recent match\n` +
     `stats <team>  - stats for a specific match\n` +
-    `goals         - goals so far in the active or most recent match\n` +
-    `goals <team>  - goals for a specific match`
-  );
+    `goals         - goals so far in the active/most recent match\n` +
+    `goals <team>  - goals for a specific match\n` +
+    `cards <team>  - yellow/red cards for a match\n` +
+    `subs <team>   - substitutions for a match\n` +
+    `next          - next 5 upcoming fixtures\n` +
+    `next <team>   - next fixture for a team\n` +
+    `today         - all matches today\n` +
+    `!help         - this message`;
+
+  if (isAdmin) {
+    msg +=
+      `\n\nADMIN COMMANDS\n` +
+      `!admin fixtures [date]   - list fixtures (YYYY-MM-DD, default today)\n` +
+      `!admin refresh           - re-fetch today's fixtures from ESPN\n` +
+      `!admin reconcile         - re-check stuck LIVE/HT fixtures against ESPN\n` +
+      `!admin status            - KV flags + fixture status counts\n` +
+      `!admin follow <team>     - add a team to the dynamic follow list\n` +
+      `!admin unfollow <team>   - remove a team from the dynamic follow list\n` +
+      `!admin mute <minutes>    - pause automated live posts\n` +
+      `!admin unmute            - resume automated live posts\n` +
+      `!admin run <job>         - manually run daily/hourly/midnight/live`;
+  }
+
+  return msg;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -424,4 +580,4 @@ function groupByDate(fixtures) {
     acc[date].push(f);
     return acc;
   }, {});
-}
+    }
