@@ -12,15 +12,15 @@
 
 import { fetchFixturesInRange, fetchFixturesByDate, fetchLiveFixtures, fetchEvents, fetchStats, ESPN_STATUS } from "./api.js";
 import { postToGroupMe } from "./groupme.js";
-import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatSecondHalfKickoff, formatHalfTime, formatFullTime, formatFinalStatsFollowUp, formatEvent, formatGenericGoal, formatPhaseTransition, formatLiveReply, formatFinishedReply, formatStatsReply, formatGoalsReply, formatNoMatchReply, formatAmbiguousReply, formatCommandHelp } from "./formatter.js";
+import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatSecondHalfKickoff, formatHalfTime, formatFullTime, formatFinalStatsFollowUp, formatEvent, formatGenericGoal, formatPhaseTransition } from "./formatter.js";
 import {
   upsertFixtures, getFixturesByDate, getActiveFixtures, getFixturesPendingStats,
   updateFixtureStatus, markStatsPending, clearStatsPending, setFinalScore,
   getSeenEvents, insertSeenEvent, getState, setState,
-  findFixtureByTeam, getCurrentlyLiveFixtures, getMostRecentFinishedFixture,
   logEvent, getRecentLogs, trimEventLog,
 } from "./db.js";
 import { handleAdminRequest } from "./admin.js";
+import { routeCommand, getEffectiveFollowedTeams } from "./commands.js";
 
 // Try to import country filter — if the file is deleted, no filter is applied.
 let FOLLOWED_COUNTRIES = null;
@@ -83,8 +83,20 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/groupme-webhook") {
+      // Parse the body BEFORE responding — reading the request stream from
+      // inside a detached ctx.waitUntil() after the response has already
+      // been sent is unreliable on Workers (the body stream can be torn
+      // down once the response is flushed). Parsing here guarantees the
+      // body is read while the request is still fully alive; only the
+      // downstream command handling (D1 writes, GroupMe post) is deferred.
+      let body = null;
+      try {
+        body = await request.json();
+      } catch (err) {
+        await logEvent(env.DB, "warn", `[command] webhook body was not valid JSON: ${err.message}`);
+      }
       // GroupMe expects a fast 2xx ack; do the actual work in the background.
-      ctx.waitUntil(handleGroupMeCallback(env, request));
+      ctx.waitUntil(handleGroupMeCallback(env, body));
       return new Response("ok");
     }
 
@@ -147,9 +159,9 @@ async function runMidnightCheck(env) {
   const today    = utcDate(0);
   const fixtures = await getFixturesByDate(env.DB, today);
 
-  // Filter to followed countries if in group stage
+  // Filter to followed countries (static + dynamic overrides) if in group stage
   const relevant = today <= GROUP_STAGE_END
-    ? filterFixtures(fixtures, "group")
+    ? await filterFixtures(env, fixtures, "group")
     : fixtures;
 
   const hasGames = relevant.length > 0;
@@ -197,7 +209,7 @@ async function runHourlyCheck(env) {
     return;
   }
 
-  const relevant = today <= GROUP_STAGE_END ? filterFixtures(espnFixtures, "group") : espnFixtures;
+  const relevant = today <= GROUP_STAGE_END ? await filterFixtures(env, espnFixtures, "group") : espnFixtures;
   const now = Date.now();
 
   const imminent = relevant.some((f) => {
@@ -646,7 +658,7 @@ async function initGroupStage(env) {
 
   console.log("Fetching group stage fixtures from ESPN...");
   const all      = await fetchFixturesInRange(env, GROUP_STAGE_START, GROUP_STAGE_END, "group");
-  const filtered = filterFixtures(all, "group");
+  const filtered = await filterFixtures(env, all, "group");
 
   await upsertFixtures(env.DB, all);
 
@@ -698,169 +710,58 @@ async function runDailyJob(env, force = false) {
 // at this worker's /groupme-webhook path — see README for setup. Without a
 // callback URL configured, GroupMe never calls this, and the bot behaves
 // exactly as before (posts only, no listening).
+//
+// All command parsing/handling (public commands + the "!admin" tier) lives in
+// commands.js now — this is just the GroupMe-specific entry point that
+// filters out non-user/system callbacks and hands everything else off.
 
 /**
  * Entry point for GroupMe's message callback. GroupMe posts here for every
  * message sent in the group, including the bot's own — we filter those out
- * to avoid a feedback loop, then hand recognized commands off to a handler.
+ * to avoid a feedback loop, then hand recognized commands off to commands.js.
  * Unrecognized text is ignored silently so the bot doesn't spam the group
  * in response to ordinary conversation.
+ *
+ * `body` is the already-parsed JSON payload (or null if parsing failed) —
+ * parsed by the caller before responding to GroupMe. See the /groupme-webhook
+ * route in fetch() for why parsing happens there rather than in here.
  */
-async function handleGroupMeCallback(env, request) {
-  let body;
-  try {
-    body = await request.json();
-  } catch (err) {
-    return; // not valid JSON — ignore
-  }
+async function handleGroupMeCallback(env, body) {
+  if (body === null) return; // parse already failed and was logged by the caller
 
   // Ignore the bot's own posts and any system messages (joins/leaves/etc.)
-  if (!body || body.sender_type !== "user" || body.system) return;
+  if (!body || body.sender_type !== "user" || body.system) {
+    await logEvent(
+      env.DB,
+      "debug",
+      `[command] ignored callback: sender_type=${body?.sender_type} system=${body?.system}`
+    );
+    return;
+  }
 
   const text = (body.text || "").trim();
   if (!text) return;
 
+  await logEvent(env.DB, "debug", `[command] received: "${text}"`);
+
   try {
-    await routeCommand(env, text);
+    const handled = await routeCommand(env, body, JOB_FNS);
+    await logEvent(env.DB, "info", `[command] "${text}" -> ${handled ? "handled" : "no match, ignored"}`);
   } catch (err) {
     console.error(`Command handling error for "${text}":`, err);
     await logEvent(env.DB, "error", `[command] error handling "${text}": ${err.message}`);
   }
 }
 
-/**
- * Matches the message against known commands. Anchored at the start of the
- * message (not "contains") so ordinary chat mentioning these words in a
- * sentence ("I live in Boston") doesn't accidentally trigger a reply.
- */
-async function routeCommand(env, text) {
-  const lower = text.trim().toLowerCase();
-  let match;
-
-  if ((match = lower.match(/^live\b\s*(.*)$/))) {
-    return handleLiveCommand(env, match[1].trim());
-  }
-  if ((match = lower.match(/^stats\b\s*(.*)$/))) {
-    return handleStatsCommand(env, match[1].trim());
-  }
-  if ((match = lower.match(/^goals\b\s*(.*)$/))) {
-    return handleGoalsCommand(env, match[1].trim());
-  }
-  if (lower === "!help" || lower === "commands") {
-    return postToGroupMe(env, formatCommandHelp());
-  }
-  // Not a recognized command — say nothing.
-}
-
-/**
- * Resolve which fixture a command should act on:
- *   - a search term given -> best matching fixture (active preferred over finished)
- *   - no term, exactly one live match -> that match
- *   - no term, multiple live matches -> ambiguous, let the caller ask for a team name
- *   - no term, nothing live -> most recently finished match
- */
-async function resolveTargetFixture(env, term) {
-  if (term) {
-    const fixture = await findFixtureByTeam(env.DB, term);
-    return { fixture, ambiguous: false };
-  }
-  const live = await getCurrentlyLiveFixtures(env.DB);
-  if (live.length === 1) return { fixture: live[0], ambiguous: false };
-  if (live.length > 1) return { fixture: null, ambiguous: true, candidates: live };
-  const recent = await getMostRecentFinishedFixture(env.DB);
-  return { fixture: recent, ambiguous: false };
-}
-
-/**
- * Get the current score (and, if live, status detail/clock) for a fixture.
- * For finished fixtures this reads the stored final score from D1. For
- * anything still in progress, it asks ESPN directly rather than trusting
- * any score cached in D1 — the live scoreboard is the only place with an
- * up-to-the-minute score and clock.
- */
-async function getCurrentScore(env, fixture) {
-  if (["FT", "AET", "PEN"].includes(fixture.status)) {
-    return { homeScore: fixture.final_home_score, awayScore: fixture.final_away_score };
-  }
-  try {
-    const live = await fetchLiveFixtures(env);
-    const espnEvent = live.find((e) => parseInt(e.id, 10) === fixture.id);
-    const comp = espnEvent?.competitions?.[0];
-    const home = comp?.competitors?.find((c) => c.homeAway === "home");
-    const away = comp?.competitors?.find((c) => c.homeAway === "away");
-    const statusType = comp?.status?.type;
-    return {
-      homeScore: parseInt(home?.score || "0", 10),
-      awayScore: parseInt(away?.score || "0", 10),
-      statusDetail: statusType?.detail || statusType?.description || statusType?.shortDetail || "",
-      clock: comp?.status?.displayClock || "",
-    };
-  } catch (err) {
-    await logEvent(env.DB, "warn", `[command] live score fetch failed for fixture ${fixture.id}: ${err.message}`);
-    return { homeScore: null, awayScore: null };
-  }
-}
-
-async function handleLiveCommand(env, term) {
-  const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
-  if (ambiguous) {
-    return postToGroupMe(env, formatAmbiguousReply(candidates, "live"));
-  }
-  if (!fixture) {
-    return postToGroupMe(env, formatNoMatchReply(term));
-  }
-  if (["FT", "AET", "PEN"].includes(fixture.status)) {
-    return postToGroupMe(env, formatFinishedReply(fixture));
-  }
-  const liveInfo = await getCurrentScore(env, fixture);
-  await postToGroupMe(env, formatLiveReply(fixture, liveInfo));
-}
-
-async function handleStatsCommand(env, term) {
-  const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
-  if (ambiguous) {
-    return postToGroupMe(env, formatAmbiguousReply(candidates, "stats"));
-  }
-  if (!fixture) {
-    return postToGroupMe(env, formatNoMatchReply(term));
-  }
-
-  const score = await getCurrentScore(env, fixture);
-  let stats = null;
-  try {
-    stats = await fetchStats(env, fixture.id);
-  } catch (err) {
-    await logEvent(env.DB, "warn", `[command] stats fetch failed for fixture ${fixture.id}: ${err.message}`);
-  }
-  await postToGroupMe(env, formatStatsReply(fixture, score.homeScore, score.awayScore, stats));
-}
-
-async function handleGoalsCommand(env, term) {
-  const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
-  if (ambiguous) {
-    return postToGroupMe(env, formatAmbiguousReply(candidates, "goals"));
-  }
-  if (!fixture) {
-    return postToGroupMe(env, formatNoMatchReply(term));
-  }
-
-  let plays;
-  try {
-    plays = await fetchEvents(env, fixture.id);
-  } catch (err) {
-    await logEvent(env.DB, "warn", `[command] goals fetch failed for fixture ${fixture.id}: ${err.message}`);
-    return postToGroupMe(env, `Couldn't fetch goal data for ${fixture.home} vs ${fixture.away} right now — try again shortly.`);
-  }
-  const goalPlays = (plays || []).filter((p) => p.scoringPlay === true);
-  await postToGroupMe(env, formatGoalsReply(fixture, goalPlays));
-}
 
 // ─── Country Filter ───────────────────────────────────────────────────────────
 
-function filterFixtures(fixtures, stage) {
+async function filterFixtures(env, fixtures, stage) {
   if (stage === "knockout") return fixtures;
-  if (!FOLLOWED_COUNTRIES || FOLLOWED_COUNTRIES.length === 0) return fixtures;
-  const set = new Set(FOLLOWED_COUNTRIES.map((c) => c.toLowerCase()));
+  const staticList = FOLLOWED_COUNTRIES || [];
+  const effective = await getEffectiveFollowedTeams(env, staticList);
+  if (effective.length === 0) return fixtures;
+  const set = new Set(effective.map((c) => c.toLowerCase()));
   return fixtures.filter(
     (f) => set.has(f.home.toLowerCase()) || set.has(f.away.toLowerCase())
   );
@@ -889,4 +790,4 @@ function readableDate(dateStr) {
     day:      "numeric",
     timeZone: "UTC",
   });
-  }
+}
