@@ -6,8 +6,29 @@ import { logEvent } from "./db.js";
 
 const GROUPME_API = "https://api.groupme.com/v3/bots/post";
 const MAX_LEN = 1000;
+export const MUTE_KV_KEY = "muted_until"; // KV: epoch-ms string, or absent/expired = not muted
 
-export async function postToGroupMe(env, text) {
+/**
+ * Post a message to GroupMe, unless the group is currently muted (via the
+ * "!admin mute <minutes>" command) and this call didn't opt out of that.
+ *
+ * `opts.bypassMute` should be true for direct replies to a command someone
+ * just typed (they clearly want a reply right now) and false/omitted for
+ * automated live-match postings (kickoff/goal/HT/FT), which are exactly what
+ * muting is meant to silence.
+ */
+export async function postToGroupMe(env, text, opts = {}) {
+  const { bypassMute = false } = opts;
+
+  if (!bypassMute) {
+    const mutedUntilRaw = await env.KV.get(MUTE_KV_KEY);
+    const mutedUntil = mutedUntilRaw ? parseInt(mutedUntilRaw, 10) : 0;
+    if (mutedUntil && Date.now() < mutedUntil) {
+      await logEvent(env.DB, "debug", `Muted — suppressed automated post until ${new Date(mutedUntil).toISOString()}`);
+      return true; // not a failure, just intentionally suppressed
+    }
+  }
+
   if (!env.GROUPME_BOT_ID) {
     // Fail loud — without this, JSON.stringify silently drops the bot_id key
     // entirely and GroupMe rejects the post, but the caller has no idea.
