@@ -70,17 +70,27 @@ export async function getFixturesByDate(db, date) {
  * Defaults to 70 minutes to match runHourlyCheck's own lookahead window, so
  * the two checks can never disagree about what counts as "imminent".
  */
-export async function getActiveFixtures(db, lookaheadMinutes = 70) {
+export async function getActiveFixtures(db, lookaheadMinutes = 70, lookbackHours = 4) {
   const now = Date.now();
   const windowEnd = new Date(now + lookaheadMinutes * 60 * 1000).toISOString();
+  // Lower bound is a safety net, not a correctness mechanism: a match stuck at
+  // LIVE/HT from days or weeks ago (e.g. a reconciliation backlog) should never
+  // be re-included here. 4 hours generously covers 90 min regulation + HT + ET
+  // + penalties + buffer. Without this bound, every unreconciled stale fixture
+  // gets re-checked on every minute-poll, burning through the Workers
+  // per-invocation subrequest limit and starving the actual live matches that
+  // sort after them by kickoff_utc — this is what silently dropped tonight's
+  // France vs Morocco kickoff message.
+  const windowStart = new Date(now - lookbackHours * 60 * 60 * 1000).toISOString();
   const { results } = await db
     .prepare(
       `SELECT * FROM fixtures
        WHERE kickoff_utc <= ?
+         AND kickoff_utc >= ?
          AND status NOT IN ('FT', 'AET', 'PEN')
        ORDER BY kickoff_utc ASC`
     )
-    .bind(windowEnd)
+    .bind(windowEnd, windowStart)
     .all();
   return results;
 }
@@ -214,6 +224,94 @@ export async function getMostRecentFinishedFixture(db) {
   return row || null;
 }
 
+/**
+ * Get upcoming (not-yet-started) fixtures soonest-first, optionally filtered
+ * to ones involving a team. Used by the "next"/"next <team>" chat command.
+ */
+export async function getUpcomingFixtures(db, term, limit = 5) {
+  if (term) {
+    const { results } = await db
+      .prepare(
+        `SELECT * FROM fixtures
+         WHERE status = 'NS' AND (home LIKE ? OR away LIKE ?)
+         ORDER BY kickoff_utc ASC LIMIT ?`
+      )
+      .bind(`%${term}%`, `%${term}%`, limit)
+      .all();
+    return results;
+  }
+  const { results } = await db
+    .prepare(`SELECT * FROM fixtures WHERE status = 'NS' ORDER BY kickoff_utc ASC LIMIT ?`)
+    .bind(limit)
+    .all();
+  return results;
+}
+
+/**
+ * Count of fixtures per status — used by "!admin status" for a quick health
+ * snapshot without needing the admin dashboard.
+ */
+export async function getFixtureStatusCounts(db) {
+  const { results } = await db
+    .prepare(`SELECT status, COUNT(*) as cnt FROM fixtures GROUP BY status ORDER BY cnt DESC`)
+    .all();
+  return results;
+}
+
+/**
+ * Fixtures that look stuck: still not FT/AET/PEN, but kicked off longer ago
+ * than any real match (including ET + penalties) could still be running.
+ * Mirrors getActiveFixtures' own lookback window so "stuck" here means
+ * exactly "would no longer be picked up by the live poller." Used by
+ * "!admin reconcile" to find candidates to re-check against ESPN.
+ */
+export async function getStuckFixtures(db, lookbackHours = 4) {
+  const cutoff = new Date(Date.now() - lookbackHours * 60 * 60 * 1000).toISOString();
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM fixtures
+       WHERE status NOT IN ('FT','AET','PEN')
+         AND kickoff_utc < ?
+       ORDER BY kickoff_utc ASC`
+    )
+    .bind(cutoff)
+    .all();
+  return results;
+}
+
+// ─── Dynamic Follow Overrides ─────────────────────────────────────────────────
+// Layered on top of the static countries.js list so teams can be added or
+// removed at runtime (via "!admin follow <team>" / "!admin unfollow <team>")
+// without a code edit + redeploy. Stored as a single JSON array under one
+// bot_state row.
+
+export async function getFollowedOverrides(db) {
+  const raw = await getState(db, "followed_overrides");
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function addFollowedOverride(db, team) {
+  const current = await getFollowedOverrides(db);
+  const lower = team.toLowerCase();
+  if (!current.some((t) => t.toLowerCase() === lower)) current.push(team);
+  await setState(db, "followed_overrides", JSON.stringify(current));
+  return current;
+}
+
+export async function removeFollowedOverride(db, team) {
+  const current = await getFollowedOverrides(db);
+  const lower = team.toLowerCase();
+  const next = current.filter((t) => t.toLowerCase() !== lower);
+  await setState(db, "followed_overrides", JSON.stringify(next));
+  return next;
+}
+
 // ─── Seen Events ──────────────────────────────────────────────────────────────
 
 /**
@@ -306,4 +404,4 @@ export async function trimEventLog(db, keep = 500) {
     )
     .bind(keep)
     .run();
-}
+  }
