@@ -216,7 +216,15 @@ async function runHourlyCheck(env) {
     if (f.espn_status === ESPN_STATUS.IN) return true; // live right now, per ESPN — covers HT/ET/stoppage/shootout
     const kickoff = new Date(f.kickoff_utc).getTime();
     const minsUntil = (kickoff - now) / 60000;
-    return minsUntil >= 0 && minsUntil <= 70; // about to start
+    if (minsUntil >= 0 && minsUntil <= 70) return true; // about to start
+    // Also cover matches that kicked off very recently but whose ESPN status
+    // hasn't flipped to "in" yet (observed lag right at kickoff). Without this,
+    // an hourly check landing at/just after the top of the hour — the same
+    // moment most kickoffs happen — can clear game_imminent the instant a
+    // match starts, silently skipping the kickoff post until the next hourly
+    // check an hour later.
+    const minsAgo = (now - kickoff) / 60000;
+    return minsAgo >= 0 && minsAgo <= 20;
   });
 
   await env.KV.put(KV_GAME_IMMINENT, imminent ? "1" : "0", {
