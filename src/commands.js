@@ -1,64 +1,56 @@
 /**
- * commands.js — GroupMe chat command handling
- *
- * Two tiers:
- *
- *   Public commands — anyone in the group can use these:
- *     live / live <team>, stats / stats <team>, goals / goals <team>,
- *     cards <team>, subs <team>, next / next <team>, today, !help / commands
- *
- *   Admin commands — gated to a single GroupMe user id (env.ADMIN_GROUPME_USER_ID),
- *     prefixed "!admin". Lets you manage the bot/database as plain text instead
- *     of opening the admin dashboard:
- *       !admin fixtures [date]   - list fixtures (default today)
- *       !admin refresh           - re-fetch today's fixtures from ESPN
- *       !admin reconcile         - re-check stuck LIVE/HT fixtures against ESPN
- *       !admin status            - KV flags + fixture status counts
- *       !admin follow <team>     - add a team to the dynamic follow list
- *       !admin unfollow <team>   - remove a team from the dynamic follow list
- *       !admin mute <minutes>    - pause automated live posts
- *       !admin unmute            - resume automated live posts
- *       !admin run <job>         - manually run daily/hourly/midnight/live
- *
- *   If ADMIN_GROUPME_USER_ID isn't set as a Cloudflare secret, admin commands
- *   are refused for everyone (fail closed, not fail open).
- *
- * `jobFns` (runDailyJob/runHourlyCheck/runMidnightCheck/runLivePolling) are
- * passed in from index.js rather than imported here, for the same reason
- * admin.js takes them as a parameter: avoids a circular import, since those
- * functions live in index.js, which imports this file.
+ * commands.js — GroupMe chat command routing
  */
 
-import { fetchLiveFixtures, fetchStats, fetchEvents, fetchFixturesByDate } from "./api.js";
-import { postToGroupMe, MUTE_KV_KEY } from "./groupme.js";
+import { fetchLiveFixtures, fetchFixturesPadded, fetchEvents, fetchStats } from "./api.js";
+import { postToGroupMe } from "./groupme.js";
 import {
-  formatLiveReply, formatFinishedReply, formatStatsReply, formatGoalsReply,
-  formatCardsReply, formatSubsReply, formatNextReply, formatTodayReply,
-  formatStatusReply, formatAdminFixtureList, formatRefreshReply, formatReconcileReply,
-  formatFollowReply, formatMuteReply, formatNoMatchReply, formatAmbiguousReply,
   formatCommandHelp,
+  formatAmbiguousReply,
+  formatNoMatchReply,
+  formatFinishedReply,
+  formatLiveReply,
+  formatStatsReply,
+  formatGoalsReply,
+  formatCardsReply,
+  formatSubsReply,
+  formatNextReply,
+  formatTodayReply,
+  formatStatusReply,
+  formatAdminFixtureList,
+  formatRefreshReply,
+  formatReconcileReply,
+  formatFollowReply,
+  formatMuteReply,
 } from "./formatter.js";
 import {
-  findFixtureByTeam, getCurrentlyLiveFixtures, getMostRecentFinishedFixture,
-  getUpcomingFixtures, getFixturesByDate, getFixtureStatusCounts, getStuckFixtures,
-  getFollowedOverrides, addFollowedOverride, removeFollowedOverride,
-  upsertFixtures, updateFixtureStatus, setFinalScore, logEvent,
+  findFixtureByTeam,
+  getCurrentlyLiveFixtures,
+  getMostRecentFinishedFixture,
+  getUpcomingFixtures,
+  getFixturesByDate,
+  getFixtureStatusCounts,
+  getStuckFixtures,
+  getFollowedOverrides,
+  addFollowedOverride,
+  removeFollowedOverride,
+  upsertFixtures,
+  updateFixtureStatus,
+  setFinalScore,
+  logEvent,
+  getState,
+  setState,
 } from "./db.js";
 
-// ─── Entry Point ───────────────────────────────────────────────────────────────
+const MUTE_KV_KEY = "muted_until";
 
-/**
- * Route a parsed GroupMe callback body to the matching command handler.
- * Returns true if the text matched a known command (handled or refused for
- * auth reasons), false if it was ordinary chat and nothing was done.
- */
 export async function routeCommand(env, body, jobFns) {
   const text = (body.text || "").trim();
   if (!text) return false;
   const lower = text.toLowerCase();
   const isAdmin = Boolean(env.ADMIN_GROUPME_USER_ID) && body.user_id === env.ADMIN_GROUPME_USER_ID;
-  let match;
 
+  let match;
   if ((match = lower.match(/^live\b\s*(.*)$/))) {
     await handleLiveCommand(env, match[1].trim());
     return true;
@@ -91,7 +83,6 @@ export async function routeCommand(env, body, jobFns) {
     await postToGroupMe(env, formatCommandHelp(isAdmin), { bypassMute: true });
     return true;
   }
-
   if (lower.startsWith("!admin")) {
     if (!isAdmin) {
       await postToGroupMe(env, "Not authorized for admin commands.", { bypassMute: true });
@@ -100,19 +91,9 @@ export async function routeCommand(env, body, jobFns) {
     await handleAdminCommand(env, lower.replace(/^!admin\b\s*/, "").trim(), jobFns);
     return true;
   }
-
-  return false; // not a recognized command — say nothing
+  return false;
 }
 
-// ─── Fixture Resolution (shared by live/stats/goals/cards/subs) ───────────────
-
-/**
- * Resolve which fixture a command should act on:
- *   - a search term given -> best matching fixture (active preferred over finished)
- *   - no term, exactly one live match -> that match
- *   - no term, multiple live matches -> ambiguous, let the caller ask for a team name
- *   - no term, nothing live -> most recently finished match
- */
 async function resolveTargetFixture(env, term) {
   if (term) {
     const fixture = await findFixtureByTeam(env.DB, term);
@@ -125,13 +106,6 @@ async function resolveTargetFixture(env, term) {
   return { fixture: recent, ambiguous: false };
 }
 
-/**
- * Get the current score (and, if live, status detail/clock) for a fixture.
- * For finished fixtures this reads the stored final score from D1. For
- * anything still in progress, it asks ESPN directly rather than trusting
- * any score cached in D1 — the live scoreboard is the only place with an
- * up-to-the-minute score and clock.
- */
 async function getCurrentScore(env, fixture) {
   if (["FT", "AET", "PEN"].includes(fixture.status)) {
     return { homeScore: fixture.final_home_score, awayScore: fixture.final_away_score };
@@ -155,8 +129,6 @@ async function getCurrentScore(env, fixture) {
   }
 }
 
-// ─── Public Commands ───────────────────────────────────────────────────────────
-
 async function handleLiveCommand(env, term) {
   const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
   if (ambiguous) return postToGroupMe(env, formatAmbiguousReply(candidates, "live"), { bypassMute: true });
@@ -172,7 +144,6 @@ async function handleStatsCommand(env, term) {
   const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
   if (ambiguous) return postToGroupMe(env, formatAmbiguousReply(candidates, "stats"), { bypassMute: true });
   if (!fixture) return postToGroupMe(env, formatNoMatchReply(term), { bypassMute: true });
-
   const score = await getCurrentScore(env, fixture);
   let stats = null;
   try {
@@ -187,7 +158,6 @@ async function handleGoalsCommand(env, term) {
   const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
   if (ambiguous) return postToGroupMe(env, formatAmbiguousReply(candidates, "goals"), { bypassMute: true });
   if (!fixture) return postToGroupMe(env, formatNoMatchReply(term), { bypassMute: true });
-
   let plays;
   try {
     plays = await fetchEvents(env, fixture.id);
@@ -203,7 +173,6 @@ async function handleCardsCommand(env, term) {
   const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
   if (ambiguous) return postToGroupMe(env, formatAmbiguousReply(candidates, "cards"), { bypassMute: true });
   if (!fixture) return postToGroupMe(env, formatNoMatchReply(term), { bypassMute: true });
-
   let plays;
   try {
     plays = await fetchEvents(env, fixture.id);
@@ -219,7 +188,6 @@ async function handleSubsCommand(env, term) {
   const { fixture, ambiguous, candidates } = await resolveTargetFixture(env, term);
   if (ambiguous) return postToGroupMe(env, formatAmbiguousReply(candidates, "subs"), { bypassMute: true });
   if (!fixture) return postToGroupMe(env, formatNoMatchReply(term), { bypassMute: true });
-
   let plays;
   try {
     plays = await fetchEvents(env, fixture.id);
@@ -242,11 +210,8 @@ async function handleTodayCommand(env) {
   await postToGroupMe(env, formatTodayReply(fixtures), { bypassMute: true });
 }
 
-// ─── Admin Commands ─────────────────────────────────────────────────────────────
-
 async function handleAdminCommand(env, rest, jobFns) {
   let match;
-
   if ((match = rest.match(/^fixtures\b\s*(.*)$/))) {
     return handleAdminFixtures(env, match[1].trim());
   }
@@ -284,7 +249,6 @@ async function handleAdminCommand(env, rest, jobFns) {
   if ((match = rest.match(/^run\s+(\w+)$/))) {
     return handleAdminRun(env, match[1], jobFns);
   }
-
   return postToGroupMe(env, `Unknown admin command. Try "!help" for the full list.`, { bypassMute: true });
 }
 
@@ -294,12 +258,19 @@ async function handleAdminFixtures(env, dateArg) {
   await postToGroupMe(env, formatAdminFixtureList(fixtures, date), { bypassMute: true });
 }
 
+/**
+ * Re-fetch today's fixtures from ESPN. Uses fetchFixturesPadded (±1 day)
+ * rather than an exact-date fetch — see api.js header comment on ESPN's
+ * date-bucketing behavior. Without this, a fixture near a UTC day boundary
+ * would come back with 0 results from an exact-date ESPN query even though
+ * it's clearly "today" in our own storage.
+ */
 async function handleAdminRefresh(env) {
   const today = new Date().toISOString().split("T")[0];
   try {
-    const raw = await fetchFixturesByDate(env, today, undefined);
+    const raw = await fetchFixturesPadded(env, today, undefined);
     await upsertFixtures(env.DB, raw);
-    await logEvent(env.DB, "info", `[admin] refresh: re-fetched ${raw.length} fixture(s) for ${today} from ESPN`);
+    await logEvent(env.DB, "info", `[admin] refresh: re-fetched ${raw.length} fixture(s) around ${today} from ESPN`);
     await postToGroupMe(env, formatRefreshReply(raw.length, today), { bypassMute: true });
   } catch (err) {
     await logEvent(env.DB, "error", `[admin] refresh failed: ${err.message}`);
@@ -308,32 +279,24 @@ async function handleAdminRefresh(env) {
 }
 
 /**
- * Re-check every fixture that looks stuck (not FT/AET/PEN, but kicked off
- * longer ago than getActiveFixtures' own lookback window) against ESPN's
- * scoreboard for that fixture's own kickoff date, and correct D1 silently
- * (no GroupMe post per match — these are, by definition, old news).
- *
- * Caveat: fetchFixturesByDate's normalized shape only exposes ESPN's coarse
- * pre/in/post state, not the fine-grained status text needed to distinguish
- * a normal FT from an AET/PEN result. Anything ESPN reports as finished is
- * marked "FT" here, even if it actually went to extra time or penalties.
- * If you know specific matches went to ET/PEN, spot-check and correct those
- * individually via the admin dashboard after running this.
+ * Re-check stuck LIVE/HT/NS fixtures against ESPN. Uses fetchFixturesPadded
+ * around each fixture's own kickoff date instead of an exact-date fetch —
+ * an exact match on the fixture's UTC kickoff date can still miss it on
+ * ESPN's side for the same date-bucketing reason (see api.js).
  */
 async function handleAdminReconcile(env) {
   const stuck = await getStuckFixtures(env.DB);
   if (stuck.length === 0) {
     return postToGroupMe(env, formatReconcileReply([]), { bypassMute: true });
   }
-
   const results = [];
   for (const fixture of stuck) {
     const date = fixture.kickoff_utc.split("T")[0];
     try {
-      const espnFixtures = await fetchFixturesByDate(env, date, fixture.stage);
+      const espnFixtures = await fetchFixturesPadded(env, date, fixture.stage);
       const match = espnFixtures.find((f) => f.id === fixture.id);
       if (!match) {
-        results.push({ ...fixture, before: fixture.status, after: fixture.status, note: "not found on ESPN for that date" });
+        results.push({ ...fixture, before: fixture.status, after: fixture.status, note: "not found on ESPN around that date" });
         continue;
       }
       if (match.espn_status === "post") {
@@ -352,7 +315,6 @@ async function handleAdminReconcile(env) {
       results.push({ ...fixture, before: fixture.status, after: fixture.status, note: "fetch failed" });
     }
   }
-
   await logEvent(env.DB, "info", `[admin] reconcile: checked ${stuck.length} stuck fixture(s)`);
   await postToGroupMe(env, formatReconcileReply(results), { bypassMute: true });
 }
@@ -372,10 +334,10 @@ async function handleAdminStatus(env) {
 
 async function handleAdminRun(env, job, jobFns) {
   const jobs = {
-    daily: () => jobFns.runDailyJob(env, true),
-    hourly: () => jobFns.runHourlyCheck(env),
+    daily:    () => jobFns.runDailyJob(env, true),
+    hourly:   () => jobFns.runHourlyCheck(env),
     midnight: () => jobFns.runMidnightCheck(env),
-    live: () => jobFns.runLivePolling(env),
+    live:     () => jobFns.runLivePolling(env),
   };
   if (!jobs[job]) {
     return postToGroupMe(env, `Unknown job "${job}". Try: daily, hourly, midnight, live.`, { bypassMute: true });
@@ -385,11 +347,6 @@ async function handleAdminRun(env, job, jobFns) {
   await postToGroupMe(env, `Ran "${job}".`, { bypassMute: true });
 }
 
-/**
- * Merge the static countries.js list with any dynamic follow overrides.
- * Exported so index.js's filterFixtures can use the combined list without
- * duplicating the merge logic.
- */
 export async function getEffectiveFollowedTeams(env, staticList) {
   const overrides = await getFollowedOverrides(env.DB);
   const set = new Set([...(staticList || []), ...overrides]);
