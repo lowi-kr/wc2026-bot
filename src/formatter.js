@@ -2,13 +2,6 @@
  * formatter.js — Format all GroupMe messages
  * All times displayed in US Eastern (ET).
  * NO EMOJIS — GroupMe's SMS fallback only supports ASCII; emojis render as "????"
- *
- * ESPN play objects have a different shape than API-Football:
- *   play.type.text          — e.g. "Goal", "Yellow Card", "Substitution"
- *   play.clock.displayValue — e.g. "45'"
- *   play.participants[]     — array of { athlete: { displayName, id }, type: { text } }
- *   play.team.displayName
- *   play.text                — human-readable description ESPN generates
  */
 
 const ET_TIMEZONE = "America/New_York";
@@ -65,16 +58,9 @@ export function formatKickoff(fixture) {
 }
 
 export function formatSecondHalfKickoff(fixture, homeScore, awayScore) {
-  return (
-    `SECOND HALF UNDERWAY\n` +
-    `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`
-  );
+  return `SECOND HALF UNDERWAY\n${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`;
 }
 
-/**
- * Announce an extra-time / shootout phase transition.
- * `phase` is one of: "et_first_half", "et_halftime", "et_second_half", "shootout".
- */
 export function formatPhaseTransition(phase, fixture, homeScore, awayScore) {
   const score = `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`;
   switch (phase) {
@@ -91,9 +77,6 @@ export function formatPhaseTransition(phase, fixture, homeScore, awayScore) {
   }
 }
 
-/**
- * Half-time message, optionally with stats if available.
- */
 export function formatHalfTime(fixture, homeScore, awayScore, stats) {
   let msg =
     `HALF TIME\n` +
@@ -105,31 +88,15 @@ export function formatHalfTime(fixture, homeScore, awayScore, stats) {
   return msg;
 }
 
-/**
- * @param {object} fixture
- * @param {number} homeScore
- * @param {number} awayScore
- * @param {Array|null} stats — ESPN boxscore.teams
- * @param {string} statusShort — "FT" | "AET" | "PEN"
- * @param {{home:number,away:number}|null} shootout — penalty shootout score, if known
- * @param {"home"|"away"|"draw"|null} winner — ESPN's winner:true/false flag, normalized
- */
 export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort, shootout, winner) {
   const label =
     statusShort === "AET" ? "FULL TIME (AET)" :
     statusShort === "PEN" ? "FULL TIME (Penalties)" :
     "FULL TIME";
 
-  // Regulation/ET score is level by definition whenever a match goes to
-  // penalties (that's the entire reason it went to penalties) — so a
-  // PEN result is NEVER a "Draw" overall even when homeScore===awayScore.
-  // We prefer ESPN's own winner:true/false flag (passed in as `winner`,
-  // one of "home"/"away"/"draw"/null) since it's authoritative and
-  // correctly reflects shootout outcomes. Score comparison is only a
-  // fallback for when that flag isn't present in the payload at all.
   let winnerLine;
   if (statusShort === "PEN") {
-    if (shootout && (shootout.home != null) && (shootout.away != null)) {
+    if (shootout && shootout.home != null && shootout.away != null) {
       winnerLine = shootout.home > shootout.away
         ? `${fixture.home} win on penalties (${shootout.home}-${shootout.away})`
         : `${fixture.away} win on penalties (${shootout.away}-${shootout.home})`;
@@ -138,8 +105,6 @@ export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort
     } else if (winner === "away") {
       winnerLine = `${fixture.away} win on penalties`;
     } else {
-      // No shootout score AND no winner flag — we know it went to
-      // penalties but can't confirm who won. Say so rather than guessing.
       winnerLine = "Decided on penalties";
     }
   } else if (winner === "home") {
@@ -149,9 +114,6 @@ export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort
   } else if (winner === "draw") {
     winnerLine = "Draw";
   } else {
-    // No winner flag in the payload at all — fall back to score
-    // comparison (the old behavior), which is fine for non-PEN results
-    // since the score reliably reflects the outcome outside of shootouts.
     winnerLine =
       homeScore > awayScore ? `${fixture.home} win` :
       awayScore > homeScore ? `${fixture.away} win` :
@@ -170,28 +132,13 @@ export function formatFullTime(fixture, homeScore, awayScore, stats, statusShort
   return msg;
 }
 
-/**
- * Follow-up message used when full-time stats weren't ready yet at the
- * moment FULL TIME was posted, and arrived later on a retry instead.
- * Kept as a separate function so the FULL TIME result itself is never
- * delayed waiting on stats.
- */
 export function formatFinalStatsFollowUp(fixture, homeScore, awayScore, stats) {
   const statsBlock = formatStatsBlock(stats);
   if (!statsBlock) return null;
-  return (
-    `FINAL STATS\n` +
-    `${fixture.home} ${homeScore}-${awayScore} ${fixture.away}\n\n` +
-    `${statsBlock}`
-  );
+  return `FINAL STATS\n${fixture.home} ${homeScore}-${awayScore} ${fixture.away}\n\n${statsBlock}`;
 }
 
-/**
- * Format a single ESPN goal play into a GroupMe message.
- * Only goals are posted live (no commentary source for cards/subs yet).
- */
 export function formatEvent(play, fixture, homeScore, awayScore) {
-  // scoringPlay===true is the entry condition — we only call this for real goals.
   const min   = play.clock?.displayValue || "?'";
   const team  = play.team?.displayName || "";
   const score = `${homeScore}-${awayScore}`;
@@ -199,11 +146,8 @@ export function formatEvent(play, fixture, homeScore, awayScore) {
   const scorer = play.participants?.find((p) => p.type?.text === "Scorer")?.athlete?.displayName;
   const assist = play.participants?.find((p) => p.type?.text === "Assist")?.athlete?.displayName;
 
-  // Fall back to ESPN's own description text if participant data is missing
   const name = scorer || extractNameFromText(play.text) || "Goal";
 
-  // p.ownGoal and p.penaltyKick are confirmed boolean fields on ESPN play
-  // objects (verified from live WC2026 data 2026-06-29).
   const isOG      = play.ownGoal === true;
   const isPenalty = play.penaltyKick === true;
 
@@ -220,20 +164,10 @@ export function formatEvent(play, fixture, homeScore, awayScore) {
   );
 }
 
-/**
- * Fallback goal message when no matching play data is found at all —
- * still tells the group the score changed.
- */
 export function formatGenericGoal(fixture, homeScore, awayScore) {
   return `GOAL\n${fixture.home} ${homeScore}-${awayScore} ${fixture.away}`;
 }
 
-// ─── Chat Command Replies ─────────────────────────────────────────────────────
-
-/**
- * Reply to the "live" command. `liveInfo` is whatever getCurrentScore()
- * in index.js resolved: { homeScore, awayScore, statusDetail, clock }.
- */
 export function formatLiveReply(fixture, liveInfo) {
   const { homeScore, awayScore, statusDetail, clock } = liveInfo || {};
   const scoreLine = `${fixture.home} ${homeScore ?? "?"}-${awayScore ?? "?"} ${fixture.away}`;
@@ -241,9 +175,6 @@ export function formatLiveReply(fixture, liveInfo) {
   return `LIVE\n${scoreLine}${detailLine ? `\n${detailLine}` : ""}`;
 }
 
-/**
- * Reply to the "live" command for a match that's already finished.
- */
 export function formatFinishedReply(fixture) {
   const label =
     fixture.status === "AET" ? "FULL TIME (AET)" :
@@ -254,9 +185,6 @@ export function formatFinishedReply(fixture) {
   return `${label}\n${fixture.home} ${h ?? "?"}-${a ?? "?"} ${fixture.away}`;
 }
 
-/**
- * Reply to the "stats" command.
- */
 export function formatStatsReply(fixture, homeScore, awayScore, stats) {
   const header = ["FT", "AET", "PEN"].includes(fixture.status) ? "FULL TIME" : "STATS";
   const statsBlock = formatStatsBlock(stats);
@@ -269,15 +197,10 @@ export function formatStatsReply(fixture, homeScore, awayScore, stats) {
   return msg;
 }
 
-/**
- * Reply to the "goals" command — one line per goal, in order.
- * `goalPlays` are raw ESPN play objects already filtered to scoringPlay===true.
- */
 export function formatGoalsReply(fixture, goalPlays) {
   if (!goalPlays || goalPlays.length === 0) {
     return `GOALS\n${fixture.home} vs ${fixture.away}\nNo goals yet.`;
   }
-
   const lines = [`GOALS\n${fixture.home} vs ${fixture.away}`];
   for (const play of goalPlays) {
     const min = play.clock?.displayValue || "?'";
@@ -290,11 +213,6 @@ export function formatGoalsReply(fixture, goalPlays) {
   return lines.join("\n");
 }
 
-/**
- * Reply to the "cards" command — yellow/red cards in match order.
- * `cardPlays` are raw ESPN play objects already filtered to
- * yellowCard===true || redCard===true.
- */
 export function formatCardsReply(fixture, cardPlays) {
   if (!cardPlays || cardPlays.length === 0) {
     return `CARDS\n${fixture.home} vs ${fixture.away}\nNo cards yet.`;
@@ -310,10 +228,6 @@ export function formatCardsReply(fixture, cardPlays) {
   return lines.join("\n");
 }
 
-/**
- * Reply to the "subs" command — substitutions in match order.
- * `subPlays` are raw ESPN play objects already filtered to substitution===true.
- */
 export function formatSubsReply(fixture, subPlays) {
   if (!subPlays || subPlays.length === 0) {
     return `SUBSTITUTIONS\n${fixture.home} vs ${fixture.away}\nNone yet.`;
@@ -324,15 +238,12 @@ export function formatSubsReply(fixture, subPlays) {
     const team = play.team?.displayName || "";
     const inPlayer = play.participants?.find((p) => p.type?.text === "SubstituteIn")?.athlete?.displayName;
     const outPlayer = play.participants?.find((p) => p.type?.text === "SubstituteOut")?.athlete?.displayName;
-    const desc = inPlayer && outPlayer ? `${inPlayer} on for ${outPlayer}` : (play.text || "Substitution");
+    const desc = inPlayer && outPlayer ? `${inPlayer} on for ${outPlayer}` : play.text || "Substitution";
     lines.push(`${min} ${desc}${team ? ` (${team})` : ""}`);
   }
   return lines.join("\n");
 }
 
-/**
- * Reply to the "next"/"next <team>" command.
- */
 export function formatNextReply(fixtures, term) {
   if (!fixtures || fixtures.length === 0) {
     return term ? `No upcoming fixture found for "${term}".` : `No upcoming fixtures scheduled.`;
@@ -346,32 +257,15 @@ export function formatNextReply(fixtures, term) {
   return lines.join("\n");
 }
 
-/**
- * Reply to the "today" command — thin wrapper around the existing daily
- * schedule formatter so the wording matches what's already posted at 8AM.
- */
 export function formatTodayReply(fixtures) {
   return formatDailySchedule(fixtures, "Today");
 }
 
-/**
- * Reply to "!admin status" — quick health snapshot without the dashboard.
- */
 export function formatStatusReply({ gamesToday, gameImminent, statusCounts, muted }) {
   const counts = (statusCounts || []).map((r) => `  ${r.status}: ${r.cnt}`).join("\n") || "  (none)";
-  return (
-    `BOT STATUS\n` +
-    `games_today:    ${gamesToday}\n` +
-    `game_imminent:  ${gameImminent}\n` +
-    `muted:          ${muted ? "yes" : "no"}\n\n` +
-    `Fixtures by status:\n${counts}`
-  );
+  return `BOT STATUS\ngames_today:    ${gamesToday}\ngame_imminent:  ${gameImminent}\nmuted:          ${muted ? "yes" : "no"}\n\nFixtures by status:\n${counts}`;
 }
 
-/**
- * Reply to "!admin fixtures [date]" — a plain-text fixture list, the text
- * alternative to browsing the admin dashboard.
- */
 export function formatAdminFixtureList(fixtures, label) {
   if (!fixtures || fixtures.length === 0) {
     return `${label}: no fixtures found.`;
@@ -383,16 +277,10 @@ export function formatAdminFixtureList(fixtures, label) {
   return lines.join("\n");
 }
 
-/**
- * Reply to "!admin refresh".
- */
 export function formatRefreshReply(count, date) {
   return `Refreshed ${date} from ESPN: ${count} fixture(s) upserted.`;
 }
 
-/**
- * Reply to "!admin reconcile".
- */
 export function formatReconcileReply(results) {
   if (!results || results.length === 0) {
     return `Nothing to reconcile — no stuck fixtures found.`;
@@ -404,35 +292,20 @@ export function formatReconcileReply(results) {
   return lines.join("\n");
 }
 
-/**
- * Reply to "!admin follow <team>" / "!admin unfollow <team>".
- */
 export function formatFollowReply(action, team, list) {
   const listLine = list.length ? list.join(", ") : "(none)";
   return `${action === "add" ? "Added" : "Removed"} "${team}". Current overrides: ${listLine}`;
 }
 
-/**
- * Reply to "!admin mute <minutes>" / "!admin unmute".
- */
 export function formatMuteReply(minutes) {
   if (minutes == null) return `Unmuted — automated live posts will resume immediately.`;
   return `Muted for ${minutes} minute(s) — automated live posts (kickoff/goal/HT/FT) are paused. Commands still work.`;
 }
 
-/**
- * Reply when a search term matches no fixture, or nothing is live/recent.
- */
 export function formatNoMatchReply(term) {
-  return term
-    ? `No match found for "${term}".`
-    : `No match is live right now, and I couldn't find a recent one.`;
+  return term ? `No match found for "${term}".` : `No match is live right now, and I couldn't find a recent one.`;
 }
 
-/**
- * Reply when more than one match is live and a command needs a team name
- * to disambiguate.
- */
 export function formatAmbiguousReply(candidates, commandHint) {
   const MAX_LISTED = 8;
   const shown = candidates.slice(0, MAX_LISTED).map((f) => `  ${f.home} vs ${f.away}`);
@@ -444,77 +317,61 @@ export function formatAmbiguousReply(candidates, commandHint) {
 }
 
 export function formatCommandHelp(isAdmin = false) {
-  let msg =
-    `BOT COMMANDS\n` +
-    `live          - score/status of the live match(es)\n` +
-    `live <team>   - status of a specific match\n` +
-    `stats         - stats for the active or most recent match\n` +
-    `stats <team>  - stats for a specific match\n` +
-    `goals         - goals so far in the active/most recent match\n` +
-    `goals <team>  - goals for a specific match\n` +
-    `cards <team>  - yellow/red cards for a match\n` +
-    `subs <team>   - substitutions for a match\n` +
-    `next          - next 5 upcoming fixtures\n` +
-    `next <team>   - next fixture for a team\n` +
-    `today         - all matches today\n` +
-    `!help         - this message`;
+  let msg = `BOT COMMANDS
+live          - score/status of the live match(es)
+live <team>   - status of a specific match
+stats         - stats for the active or most recent match
+stats <team>  - stats for a specific match
+goals         - goals so far in the active/most recent match
+goals <team>  - goals for a specific match
+cards <team>  - yellow/red cards for a match
+subs <team>   - substitutions for a match
+next          - next 5 upcoming fixtures
+next <team>   - next fixture for a team
+today         - all matches today
+!help         - this message`;
 
   if (isAdmin) {
-    msg +=
-      `\n\nADMIN COMMANDS\n` +
-      `!admin fixtures [date]   - list fixtures (YYYY-MM-DD, default today)\n` +
-      `!admin refresh           - re-fetch today's fixtures from ESPN\n` +
-      `!admin reconcile         - re-check stuck LIVE/HT fixtures against ESPN\n` +
-      `!admin status            - KV flags + fixture status counts\n` +
-      `!admin follow <team>     - add a team to the dynamic follow list\n` +
-      `!admin unfollow <team>   - remove a team from the dynamic follow list\n` +
-      `!admin mute <minutes>    - pause automated live posts\n` +
-      `!admin unmute            - resume automated live posts\n` +
-      `!admin run <job>         - manually run daily/hourly/midnight/live`;
-  }
+    msg += `
 
+ADMIN COMMANDS
+!admin fixtures [date]   - list fixtures (YYYY-MM-DD, default today)
+!admin refresh           - re-fetch today's fixtures from ESPN
+!admin reconcile         - re-check stuck LIVE/HT fixtures against ESPN
+!admin status            - KV flags + fixture status counts
+!admin follow <team>     - add a team to the dynamic follow list
+!admin unfollow <team>   - remove a team from the dynamic follow list
+!admin mute <minutes>    - pause automated live posts
+!admin unmute            - resume automated live posts
+!admin run <job>         - manually run daily/hourly/midnight/live`;
+  }
   return msg;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Build a plain-text stats block from ESPN boxscore.teams data.
- * Returns null if no stats could be matched at all.
- *
- * ESPN's soccer "statistics" entries don't reliably use the same `name`
- * key across feeds/seasons, but every entry also carries a human-readable
- * `label` (and often an `abbreviation`). We match against a list of known
- * aliases per stat against name/label/abbreviation (lowercased, with
- * non-alphanumeric characters stripped) instead of trusting one exact key
- * — this is the actual fix for corners/fouls showing up as "-": the old
- * code matched only the literal names "cornerKicks"/"fouls", which aren't
- * what ESPN's soccer feed actually uses for those two stats. Any stat with
- * no match on either side is left out of the message entirely rather than
- * rendered as a placeholder "-".
- */
-export function formatStatsBlock(stats) {
+function formatStatsBlock(stats) {
   if (!stats || stats.length < 2) return null;
 
   const h = stats.find((t) => t.homeAway === "home") || stats[0];
   const a = stats.find((t) => t.homeAway === "away") || stats[1];
 
   const STAT_DEFS = [
-    { label: "Possession",   aliases: ["possessionpct", "possession", "ballpossession", "possession%"] },
-    { label: "Shots",        aliases: ["totalshots", "shotstotal", "shots"] },
-    { label: "On Target",    aliases: ["shotsontarget", "shotsongoal", "ontargetscoringatt", "totalshotsontarget"] },
-    { label: "Corners",      aliases: ["cornerkicks", "wontcorners", "corners", "cornerkicksearned"] },
-    { label: "Fouls",        aliases: ["fouls", "foulscommitted", "foulscommited"] },
+    { label: "Possession",  aliases: ["possessionpct", "possession", "ballpossession", "possession%"] },
+    { label: "Shots",       aliases: ["totalshots", "shotstotal", "shots"] },
+    { label: "On Target",   aliases: ["shotsontarget", "shotsongoal", "ontargetscoringatt", "totalshotsontarget"] },
+    { label: "Corners",     aliases: ["cornerkicks", "wontcorners", "corners", "cornerkicksearned"] },
+    { label: "Fouls",       aliases: ["fouls", "foulscommitted", "foulscommited"] },
     { label: "Yellow Cards", aliases: ["yellowcards", "totalyellowcards"] },
-    { label: "Red Cards",    aliases: ["redcards", "totalredcards"] },
-    { label: "Offsides",     aliases: ["offsides", "totaloffsides"] },
+    { label: "Red Cards",   aliases: ["redcards", "totalredcards"] },
+    { label: "Offsides",    aliases: ["offsides", "totaloffsides"] },
   ];
 
   const rows = [];
   for (const def of STAT_DEFS) {
     const hVal = findStat(h, def.aliases);
     const aVal = findStat(a, def.aliases);
-    if (hVal == null && aVal == null) continue; // not found on either side — skip the row
+    if (hVal == null && aVal == null) continue;
     rows.push(`${padLabel(def.label)} ${hVal ?? "-"} - ${aVal ?? "-"}`);
   }
 
@@ -522,11 +379,6 @@ export function formatStatsBlock(stats) {
   return `STATS\n` + rows.join("\n");
 }
 
-/**
- * Find a stat's displayValue by matching its `name`, `label`, or
- * `abbreviation` field (normalized: lowercased, non-alphanumeric stripped)
- * against a list of known aliases.
- */
 function findStat(teamStats, aliases) {
   const list = teamStats?.statistics || [];
   for (const s of list) {
@@ -545,10 +397,6 @@ function padLabel(label) {
   return (label + ":").padEnd(width, " ");
 }
 
-/**
- * Try to pull a player name out of ESPN's auto-generated play text,
- * e.g. "Granit Xhaka  Goal - Switzerland 1, Bosnia-Herzegovina 0" -> "Granit Xhaka"
- */
 function extractNameFromText(text) {
   if (!text) return null;
   const match = text.match(/^([A-Za-zÀ-ÿ' -]+?)\s+(Goal|scores)/i);
@@ -580,4 +428,4 @@ function groupByDate(fixtures) {
     acc[date].push(f);
     return acc;
   }, {});
-    }
+}
