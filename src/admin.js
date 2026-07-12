@@ -1,43 +1,20 @@
 /**
- * admin.js — Password-protected dashboard for the WC2026 bot
- *
- * Routes handled (all under /admin, wired in index.js):
- *   GET  /admin              — dashboard page (requires auth cookie)
- *   POST /admin/login        — checks password, sets auth cookie
- *   POST /admin/logout       — clears auth cookie
- *   POST /admin/override     — flips games_today / game_imminent flags
- *   POST /admin/refresh      — re-fetches today's fixtures from ESPN
- *   POST /admin/reset        — resets a single fixture (status + seen_events)
- *   POST /admin/run          — manually runs an existing job (daily/hourly/live/midnight)
- *   GET  /admin/data         — JSON snapshot (flags, fixtures, log) polled by
- *                              the dashboard's own JS for live auto-refresh
- *
- * Action forms (override/refresh/reset/run) are progressively enhanced: the
- * dashboard's inline script submits them via fetch() and re-polls /admin/data
- * afterward instead of doing a full-page redirect. If JS is disabled, the
- * plain <form> POST + 302 redirect still works exactly as before.
- *
- * Auth model: a single shared password (env.DASHBOARD_PASSWORD) checked
- * against a cookie holding a signed-ish token (HMAC over a fixed secret +
- * day, using the password itself as the key — good enough for a private,
- * single-user dashboard; this is NOT meant to gate anything more sensitive
- * than "don't let randoms flip my bot's flags").
+ * admin.js — Password-protected /admin dashboard
  */
 
+import { fetchFixturesPadded } from "./api.js";
 import {
+  upsertFixtures,
   getFixturesByDate,
   getActiveFixtures,
+  resetFixtureState,
   getRecentLogs,
   logEvent,
-  upsertFixtures,
 } from "./db.js";
-import { fetchFixturesByDate } from "./api.js";
 
-const COOKIE_NAME = "wc2026_admin";
-const KV_GAMES_TODAY = "games_today";
-const KV_GAME_IMMINENT = "game_imminent";
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
+const COOKIE_NAME       = "wc2026_admin";
+const KV_GAMES_TODAY    = "games_today";
+const KV_GAME_IMMINENT  = "game_imminent";
 
 export async function handleAdminRequest(request, env, ctx, url, jobFns) {
   const path = url.pathname;
@@ -45,12 +22,10 @@ export async function handleAdminRequest(request, env, ctx, url, jobFns) {
   if (path === "/admin/login" && request.method === "POST") {
     return handleLogin(request, env);
   }
-
   if (path === "/admin/logout" && request.method === "POST") {
     return handleLogout();
   }
 
-  // Everything else under /admin requires auth
   const authed = await isAuthed(request, env);
 
   if (path === "/admin" && request.method === "GET") {
@@ -81,8 +56,6 @@ export async function handleAdminRequest(request, env, ctx, url, jobFns) {
   return new Response("Not found", { status: 404 });
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-
 async function signToken(password, dayStr) {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -105,10 +78,7 @@ function todayStr() {
 }
 
 async function isAuthed(request, env) {
-  if (!env.DASHBOARD_PASSWORD) {
-    // Misconfigured — fail closed.
-    return false;
-  }
+  if (!env.DASHBOARD_PASSWORD) return false;
   const cookie = getCookie(request, COOKIE_NAME);
   if (!cookie) return false;
   const expected = await signToken(env.DASHBOARD_PASSWORD, todayStr());
@@ -136,11 +106,9 @@ async function handleLogin(request, env) {
   }
   const form = await request.formData();
   const password = form.get("password") || "";
-
   if (!timingSafeEqual(password, env.DASHBOARD_PASSWORD)) {
     return renderLoginPage("Incorrect password.");
   }
-
   const token = await signToken(env.DASHBOARD_PASSWORD, todayStr());
   return new Response(null, {
     status: 302,
@@ -161,32 +129,36 @@ function handleLogout() {
   });
 }
 
-// ─── Action handlers ──────────────────────────────────────────────────────────
-
 async function handleOverride(request, env) {
   const form = await request.formData();
   const flag = form.get("flag");
   const value = form.get("value");
-
   if (![KV_GAMES_TODAY, KV_GAME_IMMINENT].includes(flag) || !["0", "1"].includes(value)) {
     return new Response("Bad request", { status: 400 });
   }
-
   await env.KV.put(flag, value, { expirationTtl: 60 * 60 * 26 });
   await logEvent(env.DB, "info", `[manual override] ${flag} set to ${value} via dashboard`);
-
   return redirectToAdmin(request);
 }
 
+/**
+ * Refresh today's fixtures from ESPN.
+ * Uses fetchFixturesPadded (±1 day) instead of an exact-date fetch, since
+ * ESPN's own dates= scoreboard parameter buckets matches by its own
+ * match-day convention (not UTC midnight) — an exact-date fetch can silently
+ * come back with 0 results for a fixture that's clearly "today" in our UTC
+ * storage. Upserting the padded range is safe: D1's own date filtering
+ * (getFixturesByDate) still scopes display correctly afterward.
+ */
 async function handleRefresh(request, env) {
   try {
     const today = utcDate(0);
-    const raw = await fetchFixturesByDate(env, today, undefined);
+    const raw = await fetchFixturesPadded(env, today, undefined);
     await upsertFixtures(env.DB, raw);
     await logEvent(
       env.DB,
       "info",
-      `[manual refresh] re-fetched ${raw.length} fixture(s) for ${today} from ESPN`
+      `[manual refresh] re-fetched ${raw.length} fixture(s) around ${today} from ESPN`
     );
   } catch (err) {
     await logEvent(env.DB, "error", `[manual refresh] failed: ${err.message}`);
@@ -194,50 +166,39 @@ async function handleRefresh(request, env) {
   return redirectToAdmin(request);
 }
 
+/**
+ * Reset a fixture back to NS for retesting. Delegates to db.js's
+ * resetFixtureState so the dashboard and ?action=reset_fixture (index.js)
+ * can never drift out of sync on what "reset" actually clears again —
+ * previously this only cleared seen_events + status, leaving stats_pending,
+ * final scores, and the FT-stats retry counter stale.
+ */
 async function handleReset(request, env) {
   const form = await request.formData();
   const id = form.get("id");
   if (!id) return new Response("Missing fixture id", { status: 400 });
-
-  await env.DB.prepare("DELETE FROM seen_events WHERE fixture_id = ?").bind(id).run();
-  await env.DB.prepare("UPDATE fixtures SET status = 'NS' WHERE id = ?").bind(id).run();
-  await logEvent(env.DB, "info", `[manual reset] fixture ${id} reset to NS via dashboard`);
-
+  await resetFixtureState(env.DB, id);
+  await logEvent(env.DB, "info", `[manual reset] fixture ${id} fully reset to NS via dashboard`);
   return redirectToAdmin(request);
 }
 
 async function handleRun(request, env, ctx, jobFns) {
   const form = await request.formData();
   const job = form.get("job");
-
-  // jobFns is passed in from index.js (runDailyJob, runHourlyCheck, etc.)
-  // rather than imported here, to avoid a circular import — index.js
-  // already imports this file to wire up the /admin routes.
   const jobs = {
-    daily: () => jobFns.runDailyJob(env, true),
-    hourly: () => jobFns.runHourlyCheck(env),
+    daily:    () => jobFns.runDailyJob(env, true),
+    hourly:   () => jobFns.runHourlyCheck(env),
     midnight: () => jobFns.runMidnightCheck(env),
-    live: () => jobFns.runLivePolling(env),
+    live:     () => jobFns.runLivePolling(env),
   };
-
   if (!jobs[job]) return new Response("Unknown job", { status: 400 });
-
   await logEvent(env.DB, "info", `[manual run] triggered "${job}" via dashboard`);
   await jobs[job]();
-
   return redirectToAdmin(request);
 }
 
-/**
- * JSON snapshot of everything the dashboard renders, minus the login chrome.
- * Polled by the dashboard's own inline script every few seconds, and by the
- * AJAX'd action forms right after they submit, so the page updates itself
- * without a full reload. Reuses the exact same fragment renderers as the
- * server-rendered page so the two never drift apart.
- */
 async function handleData(env) {
   const today = utcDate(0);
-
   const [fixturesToday, activeFixtures, gamesToday, gameImminent, logs] = await Promise.all([
     getFixturesByDate(env.DB, today),
     getActiveFixtures(env.DB),
@@ -254,8 +215,7 @@ async function handleData(env) {
     todayFixturesHtml: renderFixturesTable(fixturesToday),
     hasActive: activeFixtures.length > 0,
     activeFixturesHtml: renderFixturesTable(activeFixtures),
-    logHtml:
-      logs.length === 0 ? "<p class='hint'>No log entries yet.</p>" : logs.map(renderLogLine).join(""),
+    logHtml: logs.length === 0 ? "<p class='hint'>No log entries yet.</p>" : logs.map(renderLogLine).join(""),
   };
 
   return new Response(JSON.stringify(body), {
@@ -263,11 +223,6 @@ async function handleData(env) {
   });
 }
 
-/**
- * Marker header sent by the dashboard's own fetch() calls so handlers can
- * tell an AJAX'd form submit apart from a plain-HTML fallback POST (e.g. if
- * the user has JS disabled, or is hitting the endpoint with curl).
- */
 function isAjax(request) {
   return request.headers.get("X-Requested-With") === "fetch";
 }
@@ -286,8 +241,6 @@ function utcDate(offsetDays = 0) {
   d.setUTCDate(d.getUTCDate() + offsetDays);
   return d.toISOString().split("T")[0];
 }
-
-// ─── Rendering ────────────────────────────────────────────────────────────────
 
 function renderLoginPage(error) {
   const html = `<!DOCTYPE html>
@@ -314,7 +267,6 @@ function renderLoginPage(error) {
 
 async function renderDashboard(env) {
   const today = utcDate(0);
-
   const [fixturesToday, activeFixtures, gamesToday, gameImminent, logs] = await Promise.all([
     getFixturesByDate(env.DB, today),
     getActiveFixtures(env.DB),
@@ -428,7 +380,6 @@ async function renderDashboard(env) {
   <script>${DASHBOARD_JS}</script>
 </body>
 </html>`;
-
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
@@ -522,18 +473,6 @@ const BASE_CSS = `
   button:disabled { opacity: 0.6; cursor: default; }
 `;
 
-/**
- * Dashboard auto-refresh + AJAX action forms. Plain vanilla JS, no build
- * step — this string is dropped straight into a <script> tag by
- * renderDashboard(). Polls GET /admin/data on an interval and patches the
- * DOM in place, so live scores/flags/log update without a manual reload.
- * Pauses polling while the tab is hidden to avoid burning D1/KV reads for
- * nothing, and re-fetches immediately when the tab becomes visible again.
- *
- * NOTE: this string must not contain any \${...} sequences — it's embedded
- * inside admin.js's own template literals, which would otherwise try to
- * interpolate them.
- */
 const DASHBOARD_JS = `
 (function () {
   var REFRESH_MS = 15000;
