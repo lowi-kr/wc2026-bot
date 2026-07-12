@@ -10,14 +10,43 @@
  *   Every minute  — only if game_imminent=true, runs live polling
  */
 
-import { fetchFixturesInRange, fetchFixturesByDate, fetchLiveFixtures, fetchEvents, fetchStats, ESPN_STATUS } from "./api.js";
-import { postToGroupMe } from "./groupme.js";
-import { formatGroupStageSchedule, formatDailySchedule, formatKickoff, formatSecondHalfKickoff, formatHalfTime, formatFullTime, formatFinalStatsFollowUp, formatEvent, formatGenericGoal, formatPhaseTransition } from "./formatter.js";
 import {
-  upsertFixtures, getFixturesByDate, getActiveFixtures, getFixturesPendingStats,
-  updateFixtureStatus, markStatsPending, clearStatsPending, setFinalScore,
-  getSeenEvents, insertSeenEvent, getState, setState,
-  logEvent, getRecentLogs, trimEventLog,
+  fetchFixturesInRange,
+  fetchFixturesPadded,
+  fetchScoreboardEvents,
+  fetchEvents,
+  fetchStats,
+  ESPN_STATUS,
+} from "./api.js";
+import { postToGroupMe } from "./groupme.js";
+import {
+  formatGroupStageSchedule,
+  formatDailySchedule,
+  formatKickoff,
+  formatSecondHalfKickoff,
+  formatPhaseTransition,
+  formatHalfTime,
+  formatFullTime,
+  formatFinalStatsFollowUp,
+  formatEvent,
+  formatGenericGoal,
+} from "./formatter.js";
+import {
+  upsertFixtures,
+  getFixturesByDate,
+  getActiveFixtures,
+  getFixturesPendingStats,
+  updateFixtureStatus,
+  markStatsPending,
+  clearStatsPending,
+  setFinalScore,
+  resetFixtureState,
+  getSeenEvents,
+  insertSeenEvent,
+  getState,
+  setState,
+  logEvent,
+  trimEventLog,
 } from "./db.js";
 import { handleAdminRequest } from "./admin.js";
 import { routeCommand, getEffectiveFollowedTeams } from "./commands.js";
@@ -38,13 +67,10 @@ const GROUP_STAGE_END   = "2026-06-26";
 // KV keys
 const KV_GAMES_TODAY    = "games_today";      // "1" or "0"
 const KV_GAME_IMMINENT  = "game_imminent";    // "1" or "0"
+const MUTE_KV_KEY        = "muted_until";
 
-// How many times to retry fetching full-time stats if they weren't ready
-// at the moment FULL TIME was posted, before giving up silently.
 const FT_STATS_MAX_RETRIES = 5;
 
-// Job functions handed to admin.js so the dashboard's "manual run" buttons
-// can call the real cron logic without a circular import.
 const JOB_FNS = {
   runDailyJob,
   runHourlyCheck,
@@ -52,24 +78,19 @@ const JOB_FNS = {
   runLivePolling,
 };
 
-// ─── Cron Entry Point ─────────────────────────────────────────────────────────
+// ─── Cron / Fetch Entry Point ─────────────────────────────────────────────────
 export default {
   async scheduled(event, env, ctx) {
     const cron = event.cron;
 
     if (cron === "0 0 * * *") {
-      // Midnight UTC — check if there are games today
       ctx.waitUntil(runMidnightCheck(env));
-      // Opportunistic cleanup so event_log doesn't grow forever
       ctx.waitUntil(trimEventLog(env.DB, 500));
     } else if (cron === "0 8 * * *") {
-      // 8AM UTC — post tomorrow's knockout schedule + fetch fixtures into D1
       ctx.waitUntil(runDailyJob(env));
     } else if (cron === "0 * * * *") {
-      // Every hour — check if a game is starting within the next 60 minutes
       ctx.waitUntil(runHourlyCheck(env));
     } else if (cron === "* * * * *") {
-      // Every minute — only runs live polling if game_imminent is set
       ctx.waitUntil(runMinutePoll(env));
     }
   },
@@ -83,19 +104,12 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/groupme-webhook") {
-      // Parse the body BEFORE responding — reading the request stream from
-      // inside a detached ctx.waitUntil() after the response has already
-      // been sent is unreliable on Workers (the body stream can be torn
-      // down once the response is flushed). Parsing here guarantees the
-      // body is read while the request is still fully alive; only the
-      // downstream command handling (D1 writes, GroupMe post) is deferred.
       let body = null;
       try {
         body = await request.json();
       } catch (err) {
         await logEvent(env.DB, "warn", `[command] webhook body was not valid JSON: ${err.message}`);
       }
-      // GroupMe expects a fast 2xx ack; do the actual work in the background.
       ctx.waitUntil(handleGroupMeCallback(env, body));
       return new Response("ok");
     }
@@ -123,17 +137,14 @@ export default {
     if (action === "reset_fixture") {
       const id = url.searchParams.get("id");
       if (!id) return new Response("Missing ?id=", { status: 400 });
-      await env.DB.prepare("DELETE FROM seen_events WHERE fixture_id = ?").bind(id).run();
-      await env.DB.prepare("UPDATE fixtures SET status = 'NS', stats_pending = 0 WHERE id = ?").bind(id).run();
-      await logEvent(env.DB, "info", `[action=reset_fixture] fixture ${id} reset to NS`);
+      await resetFixtureState(env.DB, id);
+      await logEvent(env.DB, "info", `[action=reset_fixture] fixture ${id} fully reset to NS`);
       return new Response(`Fixture ${id} reset.`);
     }
     if (action === "status") {
       const gamesToday   = await env.KV.get(KV_GAMES_TODAY);
       const gameImminent = await env.KV.get(KV_GAME_IMMINENT);
-      return new Response(
-        `games_today=${gamesToday}\ngame_imminent=${gameImminent}`
-      );
+      return new Response(`games_today=${gamesToday}\ngame_imminent=${gameImminent}`);
     }
 
     return new Response(
@@ -159,34 +170,26 @@ async function runMidnightCheck(env) {
   const today    = utcDate(0);
   const fixtures = await getFixturesByDate(env.DB, today);
 
-  // Filter to followed countries (static + dynamic overrides) if in group stage
   const relevant = today <= GROUP_STAGE_END
     ? await filterFixtures(env, fixtures, "group")
     : fixtures;
 
   const hasGames = relevant.length > 0;
-  await env.KV.put(KV_GAMES_TODAY, hasGames ? "1" : "0", {
-    expirationTtl: 60 * 60 * 26, // expire after 26 hours
-  });
-  // Reset imminent flag at midnight
+  await env.KV.put(KV_GAMES_TODAY, hasGames ? "1" : "0", { expirationTtl: 60 * 60 * 26 });
   await env.KV.put(KV_GAME_IMMINENT, "0", { expirationTtl: 60 * 60 * 26 });
+
   console.log(`Midnight check: games_today=${hasGames}, ${relevant.length} fixtures found.`);
-  await logEvent(
-    env.DB,
-    "info",
-    `[midnight] games_today=${hasGames} (${relevant.length} fixture(s) found for ${today})`
-  );
+  await logEvent(env.DB, "info", `[midnight] games_today=${hasGames} (${relevant.length} fixture(s) found for ${today})`);
 }
 
 // ─── Hourly Check ─────────────────────────────────────────────────────────────
 // Runs every hour. Only does work if games_today=1.
-// Asks ESPN directly whether anything is live or about to kick off — this is
-// deliberately NOT based on D1's cached kickoff_utc/status. A cached kickoff
-// time can drift (we found one off by an hour), and a wall-clock cutoff based
-// on it can end tracking mid-match. ESPN's own `state` stays "in" for the
-// entire match — regulation, halftime, extra time, stoppage, penalties — and
-// only flips to "post" once it's actually over, so trusting it directly here
-// removes the guesswork entirely.
+// Checks D1 (not ESPN) for a fixture kicking off within ~70 min, or already
+// underway. See api.js header comment: ESPN's own dates= scoreboard param
+// buckets games by its own match-day convention, not UTC midnight, so
+// re-fetching "today" from ESPN here can silently miss a fixture that our
+// own D1 storage correctly has as "today" in UTC terms. D1's kickoff_utc
+// column doesn't have that problem, so we use it directly instead.
 
 async function runHourlyCheck(env) {
   const gamesToday = await env.KV.get(KV_GAMES_TODAY);
@@ -195,58 +198,51 @@ async function runHourlyCheck(env) {
     return;
   }
 
-  const today = utcDate(0);
-  let espnFixtures;
-  try {
-    espnFixtures = await fetchFixturesByDate(env, today, undefined);
-  } catch (err) {
-    // Transient ESPN error — do NOT clear game_imminent on a fetch failure.
-    // Leaving the existing KV value in place is the fail-safe choice: worst
-    // case we poll one extra hour we didn't need to, instead of silently
-    // dropping a live match because ESPN hiccuped for one request.
-    console.error("Hourly check: failed to fetch ESPN scoreboard:", err);
-    await logEvent(env.DB, "error", `[hourly] failed to fetch ESPN scoreboard, leaving game_imminent unchanged: ${err.message}`);
-    return;
-  }
+  const today     = utcDate(0);
+  const yesterday = utcDate(-1);
 
-  const relevant = today <= GROUP_STAGE_END ? await filterFixtures(env, espnFixtures, "group") : espnFixtures;
+  // Check both UTC-day buckets: a fixture that just rolled across the UTC
+  // day boundary (e.g. kickoff 01:00 UTC) is stored under "today", but a
+  // fixture from "yesterday" that's running long (extra time, delays) is
+  // still worth checking too.
+  const [todayFixtures, yesterdayFixtures] = await Promise.all([
+    getFixturesByDate(env.DB, today),
+    getFixturesByDate(env.DB, yesterday),
+  ]);
+  const candidates = [...yesterdayFixtures, ...todayFixtures].filter(
+    (f) => !["FT", "AET", "PEN"].includes(f.status)
+  );
+
+  const relevant = today <= GROUP_STAGE_END
+    ? await filterFixtures(env, candidates, "group")
+    : candidates;
+
   const now = Date.now();
-
   const imminent = relevant.some((f) => {
-    if (f.espn_status === ESPN_STATUS.IN) return true; // live right now, per ESPN — covers HT/ET/stoppage/shootout
-    const kickoff = new Date(f.kickoff_utc).getTime();
+    const kickoff   = new Date(f.kickoff_utc).getTime();
     const minsUntil = (kickoff - now) / 60000;
-    if (minsUntil >= 0 && minsUntil <= 70) return true; // about to start
-    // Also cover matches that kicked off very recently but whose ESPN status
-    // hasn't flipped to "in" yet (observed lag right at kickoff). Without this,
-    // an hourly check landing at/just after the top of the hour — the same
-    // moment most kickoffs happen — can clear game_imminent the instant a
-    // match starts, silently skipping the kickoff post until the next hourly
-    // check an hour later.
+    if (minsUntil >= 0 && minsUntil <= 70) return true;
     const minsAgo = (now - kickoff) / 60000;
-    return minsAgo >= 0 && minsAgo <= 20;
+    // Bounded to 5 hours so a genuinely stuck/stale fixture (see the
+    // reconcile job) doesn't keep this flag pinned true forever and burn
+    // Cloudflare subrequests on every minute cron indefinitely.
+    return minsAgo >= 0 && minsAgo <= 300;
   });
 
-  await env.KV.put(KV_GAME_IMMINENT, imminent ? "1" : "0", {
-    expirationTtl: 60 * 60 * 2,
-  });
-  console.log(`Hourly check: game_imminent=${imminent} (source: ESPN live scoreboard)`);
-  await logEvent(env.DB, "info", `[hourly] game_imminent=${imminent} (source: ESPN live scoreboard)`);
+  await env.KV.put(KV_GAME_IMMINENT, imminent ? "1" : "0", { expirationTtl: 60 * 60 * 2 });
+  console.log(`Hourly check: game_imminent=${imminent} (source: D1 fixtures, kickoff-time math)`);
+  await logEvent(env.DB, "info", `[hourly] game_imminent=${imminent} (source: D1 fixtures, kickoff-time math)`);
 }
 
 // ─── Minute Poll ──────────────────────────────────────────────────────────────
-// Runs every minute. Exits immediately if game_imminent is not set.
 
 async function runMinutePoll(env) {
   const imminent = await env.KV.get(KV_GAME_IMMINENT);
-  if (imminent !== "1") return; // Exit instantly — no game imminent
+  if (imminent !== "1") return;
 
   await runLivePolling(env);
   await runStatsRetry(env);
 
-  // After polling, check if all active games are now finished AND no
-  // fixture is still waiting on a final-stats retry. If so, clear the
-  // imminent flag so the minute cron goes back to sleep.
   const activeInDb   = await getActiveFixtures(env.DB);
   const pendingStats = await getFixturesPendingStats(env.DB);
   if (activeInDb.length === 0 && pendingStats.length === 0) {
@@ -262,21 +258,31 @@ async function runLivePolling(env) {
   const activeInDb = await getActiveFixtures(env.DB);
   if (activeInDb.length === 0) return;
 
-  // Fetch today's full scoreboard — includes live scores and status
-  let liveEvents;
+  // Use fetchScoreboardEvents (unfiltered — includes pre/in/post) rather
+  // than the old state==="in"-only fetch. Filtering to "in" meant a fixture
+  // that just flipped to "post" vanished from this map on the very next
+  // poll, before processLiveFixture() got a chance to see the transition
+  // and post FULL TIME / store the final score / queue a stats retry —
+  // it fell through to checkIfFinished() instead, which used to just set
+  // status='FT' silently with none of that.
+  let scoreboardEvents;
   try {
-    liveEvents = await fetchLiveFixtures(env);
+    scoreboardEvents = await fetchScoreboardEvents(env);
   } catch (err) {
-    console.error("Failed to fetch live fixtures from ESPN:", err);
-    await logEvent(env.DB, "error", `[live] failed to fetch live fixtures from ESPN: ${err.message}`);
+    console.error("Failed to fetch scoreboard from ESPN:", err);
+    await logEvent(env.DB, "error", `[live] failed to fetch scoreboard from ESPN: ${err.message}`);
     return;
   }
 
-  const liveById = new Map(liveEvents.map((e) => [parseInt(e.id, 10), e]));
+  const eventsById = new Map(scoreboardEvents.map((e) => [parseInt(e.id, 10), e]));
 
   for (const dbFixture of activeInDb) {
-    const espnEvent = liveById.get(dbFixture.id);
+    const espnEvent = eventsById.get(dbFixture.id);
     if (!espnEvent) {
+      // Not on ESPN's default (dateless) scoreboard at all — this can still
+      // happen for the same date-bucketing reason (ESPN's bare scoreboard
+      // also defaults to its own "today"). Fall back to a padded date fetch
+      // so we can still detect and fully finalize a finished match.
       await checkIfFinished(env, dbFixture);
       continue;
     }
@@ -285,13 +291,13 @@ async function runLivePolling(env) {
 }
 
 async function processLiveFixture(env, dbFixture, espnEvent) {
-  const comp        = espnEvent.competitions?.[0];
-  const statusType  = comp?.status?.type;
-  const state       = statusType?.state;
-  const statusName  = statusType?.name || "";
+  const comp         = espnEvent.competitions?.[0];
+  const statusType   = comp?.status?.type;
+  const state        = statusType?.state;
+  const statusName   = statusType?.name || "";
   const statusDetail = statusType?.detail || statusType?.description || statusType?.shortDetail || "";
-  const period      = comp?.status?.period ?? null;
-  const prevStatus  = dbFixture.status;
+  const period        = comp?.status?.period ?? null;
+  const prevStatus    = dbFixture.status;
 
   const home      = comp?.competitors?.find((c) => c.homeAway === "home");
   const away      = comp?.competitors?.find((c) => c.homeAway === "away");
@@ -315,10 +321,6 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
       console.error(`Could not fetch HT stats for ${dbFixture.id}:`, err);
       await logEvent(env.DB, "warn", `[live] could not fetch HT stats for fixture ${dbFixture.id}: ${err.message}`);
     }
-    // One-time diagnostic: HT is the most reliable point to capture a real
-    // stats shape, since FT stats are sometimes still empty at the moment
-    // the match ends. Shares the same per-fixture flag as the FT capture
-    // in handleMatchEnd, so only the first one to fire actually logs.
     await logRawShapeOnce(env, `stats_shape_${dbFixture.id}`, "boxscore_team", htStats?.[0]);
     await postToGroupMe(env, formatHalfTime(dbFixture, homeScore, awayScore, htStats));
     await updateFixtureStatus(env.DB, dbFixture.id, "HT");
@@ -333,9 +335,6 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
     await logEvent(env.DB, "info", `[live] second-half kickoff posted: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away}`);
   }
 
-  // Extra time / shootout phase transitions (kickoff of ET, ET half-time,
-  // second ET half, shootout start). Best-effort: see checkExtraTimePhases
-  // for why the detection here is defensive rather than exact-string-match.
   if (state === ESPN_STATUS.IN) {
     await checkExtraTimePhases(env, dbFixture, statusName, statusDetail, period, homeScore, awayScore);
   }
@@ -353,28 +352,13 @@ async function processLiveFixture(env, dbFixture, espnEvent) {
   }
 }
 
-/**
- * Detect and announce extra-time / penalty-shootout phase transitions.
- *
- * IMPORTANT CAVEAT: unlike goal detection (which we've verified against real
- * live matches), ESPN's exact status.type.name / detail strings for extra
- * time and shootouts in this competition are NOT independently confirmed —
- * no match had reached extra time at the time this was written. Rather than
- * hardcode one guessed string and risk silently missing the transition
- * entirely (the same failure mode as the goal-detection bug), this checks
- * several defensive signals (name, free-text detail, period number) at once.
- * The raw status shape is logged the first time any of them fire, via the
- * same one-shot diagnostic pattern used for stats shapes, so the detection
- * can be tightened against real data the moment it's actually exercised.
- */
 async function checkExtraTimePhases(env, dbFixture, statusName, statusDetail, period, homeScore, awayScore) {
   const name   = (statusName || "").toUpperCase();
   const detail = (statusDetail || "").toLowerCase();
 
   const looksShootout = name.includes("SHOOTOUT") || detail.includes("shootout") || detail.includes("penalty shoot");
-  const looksExtra    = !looksShootout && (
-    name.includes("EXTRA") || name.includes("_ET") ||
-    detail.includes("extra time") ||
+  const looksExtra = !looksShootout && (
+    name.includes("EXTRA") || name.includes("_ET") || detail.includes("extra time") ||
     (typeof period === "number" && period >= 3)
   );
 
@@ -387,12 +371,11 @@ async function checkExtraTimePhases(env, dbFixture, statusName, statusDetail, pe
     else if (typeof period === "number" && period >= 4) phase = "et_second_half";
     else phase = "et_first_half";
   }
-
   if (!phase) return;
 
   const key  = `extra_phase_${dbFixture.id}`;
   const last = await getState(env.DB, key);
-  if (last === phase) return; // already announced this phase
+  if (last === phase) return;
   await setState(env.DB, key, phase);
 
   await logRawShapeOnce(env, `extra_time_shape_${dbFixture.id}`, "status_object", { statusName, statusDetail, period });
@@ -405,55 +388,30 @@ async function checkExtraTimePhases(env, dbFixture, statusName, statusDetail, pe
 }
 
 async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
-  // We only care about goals here (no live commentary source available).
-  // A goal is detected by comparing the current scoreboard score to the
-  // last-known score stored in seen_events — far more reliable than trying
-  // to dedupe individual play-by-play entries, which ESPN sometimes reports
-  // with shifting clock values between polls.
-
   const seen = await getSeenEvents(env.DB, dbFixture.id);
   const scoreKey = `score_${homeScore}_${awayScore}`;
 
-  if (seen.has(scoreKey)) return; // Already posted this score state
+  if (seen.has(scoreKey)) return;
   if (homeScore === 0 && awayScore === 0) {
-    // Nothing has happened yet — record the 0-0 state so we don't miss
-    // detecting it later, but don't post anything.
     await insertSeenEvent(env.DB, dbFixture.id, scoreKey);
     return;
   }
 
-  // Score changed since last seen — find which goal play matches this score.
   let plays;
   try {
     plays = await fetchEvents(env, dbFixture.id);
   } catch (err) {
     console.error(`Failed to fetch plays for fixture ${dbFixture.id}:`, err);
     await logEvent(env.DB, "warn", `[live] failed to fetch plays for fixture ${dbFixture.id}: ${err.message}`);
-    // Still record the score so we don't loop forever retrying
     await insertSeenEvent(env.DB, dbFixture.id, scoreKey);
     return;
   }
 
-  // Filter to actual scoring plays using ESPN's confirmed boolean field.
-  // IMPORTANT: .includes("goal") on type.text is WRONG — "Goal Kick" has
-  // type.text="Goal Kick" and matches, flooding goalPlays with routine
-  // restarts that happen many times per half. This was the real root cause
-  // of the stale/wrong goal minute: goalPlays[length-1] kept returning the
-  // most recent Goal Kick, not the actual goal. scoringPlay===true is the
-  // confirmed correct filter (verified from a live ESPN play object for
-  // this tournament: Goal Kick has scoringPlay=false, confirmed 2026-06-29).
   const goalPlays = (plays || []).filter((p) => p.scoringPlay === true);
-
-  // One-time diagnostic re-keyed as _v2 so it captures a real *scoring*
-  // play — the _v1 capture earlier in this match grabbed a Goal Kick instead
-  // (because the old filter was wrong). This fires once on the next goal.
   await logRawShapeOnce(env, `goal_play_shape_v2_${dbFixture.id}`, "goal_play", goalPlays[0] || plays[0]);
 
-  // Find the scoring play whose homeScore/awayScore fields match the current
-  // scoreboard. p.homeScore and p.awayScore are confirmed present on every
-  // ESPN play object (verified from live data 2026-06-29).
   const matchingGoal = findGoalMatchingScore(goalPlays, homeScore, awayScore);
-  const latestGoal    = matchingGoal || goalPlays[goalPlays.length - 1];
+  const latestGoal   = matchingGoal || goalPlays[goalPlays.length - 1];
 
   const totalGoalsImplied = homeScore + awayScore;
   const feedLooksStale    = !matchingGoal && goalPlays.length < totalGoalsImplied;
@@ -467,11 +425,6 @@ async function pollAndPostEvents(env, dbFixture, homeScore, awayScore) {
   await logEvent(env.DB, "info", `[live] goal posted: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away}`);
 }
 
-/**
- * Find the scoring play whose post-goal score matches the current scoreboard.
- * p.homeScore and p.awayScore are confirmed present on ESPN play objects
- * (verified from live WC2026 data 2026-06-29).
- */
 function findGoalMatchingScore(goalPlays, homeScore, awayScore) {
   for (let i = goalPlays.length - 1; i >= 0; i--) {
     const p = goalPlays[i];
@@ -490,24 +443,16 @@ async function handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, f
     console.error(`Could not fetch stats for ${dbFixture.id}:`, err);
     await logEvent(env.DB, "warn", `[live] could not fetch FT stats for fixture ${dbFixture.id}: ${err.message}`);
   }
-
-  // One-time diagnostic, in case HT never fired (e.g. a match that went
-  // straight from kickoff to some state we didn't catch HT for).
   await logRawShapeOnce(env, `stats_shape_${dbFixture.id}`, "boxscore_team", stats?.[0]);
 
   const { winner, shootout } = extractWinnerAndShootout(espnEvent, homeScore, awayScore);
 
-  // Write status BEFORE posting to GroupMe (avoids re-posting FULL TIME
-  // repeatedly if the GroupMe call itself fails).
   await updateFixtureStatus(env.DB, dbFixture.id, ftStatus);
   await setFinalScore(env.DB, dbFixture.id, homeScore, awayScore);
 
   const msg = formatFullTime(dbFixture, homeScore, awayScore, stats, ftStatus, shootout, winner);
   await postToGroupMe(env, msg);
 
-  // ESPN's boxscore frequently isn't populated yet in the same instant the
-  // match flips to "post" status — ask the minute-poll cron to retry stats
-  // shortly after, and post a short FINAL STATS follow-up if/when they show up.
   if (!stats || stats.length < 2) {
     await markStatsPending(env.DB, dbFixture.id);
     console.log(`FT stats not ready yet for fixture ${dbFixture.id} — will retry.`);
@@ -515,26 +460,16 @@ async function handleMatchEnd(env, dbFixture, espnEvent, homeScore, awayScore, f
   }
 
   console.log(`Match ended: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away} (${ftStatus})`);
-  await logEvent(
-    env.DB,
-    "info",
-    `[live] match ended: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away} (${ftStatus})`
-  );
+  await logEvent(env.DB, "info", `[live] match ended: ${dbFixture.home} ${homeScore}-${awayScore} ${dbFixture.away} (${ftStatus})`);
 }
 
 /**
- * Pull a winner flag and (if available) a penalty shootout score out of
- * the raw ESPN event. ESPN marks the winning competitor with a boolean
- * `winner: true/false` on each entry in competitions[0].competitors —
- * this is authoritative and correctly reflects shootout outcomes, unlike
- * comparing homeScore/awayScore (which are level by definition whenever a
- * match actually went to penalties).
- *
- * Shootout score field name is unverified — ESPN doesn't consistently
- * expose it in the same place across feeds. We try a couple of plausible
- * paths and fall back to null (formatFullTime then just says "Decided on
- * penalties" without a shootout score, which is the safe behavior when we
- * can't confirm a number rather than guessing).
+ * Derive winner + shootout score from a raw ESPN event's competitor objects.
+ * espnEvent can be null (e.g. when finalizing via the padded-date fallback
+ * path, which only has normalized fixture data, not the raw scoreboard
+ * event) — in that case we just return {winner: null, shootout: null} and
+ * formatFullTime() falls back to comparing homeScore/awayScore directly,
+ * which is still correct, just without the explicit shootout score line.
  */
 function extractWinnerAndShootout(espnEvent, homeScore, awayScore) {
   const comp = espnEvent?.competitions?.[0];
@@ -545,8 +480,6 @@ function extractWinnerAndShootout(espnEvent, homeScore, awayScore) {
   if (home?.winner === true) winner = "home";
   else if (away?.winner === true) winner = "away";
   else if (home?.winner === false && away?.winner === false) winner = "draw";
-  // If neither side has a winner flag at all (undefined on both), leave
-  // winner as null so formatFullTime falls back to score comparison.
 
   let shootout = null;
   const homeShootout = home?.shootoutScore ?? home?.penaltyScore ?? home?.score?.shootout;
@@ -558,13 +491,6 @@ function extractWinnerAndShootout(espnEvent, homeScore, awayScore) {
   return { winner, shootout };
 }
 
-/**
- * Retries fetching stats for any recently-finished fixture still flagged
- * as stats_pending. Runs as part of the minute poll. Posts a FINAL STATS
- * follow-up message as soon as stats become available, then clears the
- * flag. Gives up (clearing the flag without posting) after enough retries
- * that another minute cron run won't keep trying forever.
- */
 async function runStatsRetry(env) {
   const pending = await getFixturesPendingStats(env.DB);
   if (pending.length === 0) return;
@@ -579,12 +505,7 @@ async function runStatsRetry(env) {
     }
 
     if (stats && stats.length >= 2) {
-      const msg = formatFinalStatsFollowUp(
-        fixture,
-        fixture.final_home_score,
-        fixture.final_away_score,
-        stats
-      );
+      const msg = formatFinalStatsFollowUp(fixture, fixture.final_home_score, fixture.final_away_score, stats);
       if (msg) {
         await postToGroupMe(env, msg);
         await clearStatsPending(env.DB, fixture.id);
@@ -615,39 +536,40 @@ async function setRetryCount(db, fixtureId, count) {
   await setState(db, `${RETRY_STATE_PREFIX}${fixtureId}`, String(count));
 }
 
-// ─── One-Time Shape Capture ───────────────────────────────────────────────────
-// Temporary diagnostic aid: writes the raw ESPN object for a goal play or a
-// boxscore team's stats to event_log (visible in the admin dashboard's
-// activity feed) the FIRST time we see one for a given fixture, then never
-// again for that fixture — so this can't spam the log across a full match.
-// Safe to remove once the real field names (goal score fields, stat names,
-// shootout score field) have been confirmed from a live response.
-
 async function logRawShapeOnce(env, stateKey, label, payload) {
   if (!payload) return;
   const already = await getState(env.DB, stateKey);
   if (already === "1") return;
   await setState(env.DB, stateKey, "1");
   const json = JSON.stringify(payload);
-  // event_log.message is a plain TEXT column with no length cap enforced
-  // here — truncate defensively so one giant object can't bloat the table.
   const truncated = json.length > 4000 ? json.slice(0, 4000) + "...[truncated]" : json;
   await logEvent(env.DB, "debug", `[shape-capture:${label}] ${truncated}`);
   console.log(`[shape-capture:${label}]`, json);
 }
 
+/**
+ * Fallback for when an active D1 fixture doesn't show up in ESPN's default
+ * scoreboard at all (fetchScoreboardEvents). This now fully finalizes the
+ * match — posts FULL TIME, stores final score, queues a stats retry if
+ * needed — instead of silently setting status='FT' with none of that.
+ *
+ * Uses fetchFixturesPadded (±1 day around the fixture's own kickoff date)
+ * rather than an exact-date fetch, for the same ESPN date-bucketing reason
+ * documented in api.js. We don't have the raw ESPN event here (only the
+ * normalized fixture), so extractWinnerAndShootout() gets `null` and falls
+ * back to comparing homeScore/awayScore — correct, just without an explicit
+ * shootout score line if this was a penalty-shootout finish.
+ */
 async function checkIfFinished(env, dbFixture) {
   try {
-    // Use the fixture's OWN kickoff date, not "today" — if this runs after
-    // the fixture's UTC calendar day has rolled over (common for late-night
-    // kickoffs), querying "today" would never find the match again and this
-    // fixture would stay stuck as "active" forever.
     const fixtureDate = dbFixture.kickoff_utc.split("T")[0];
-    const fixtures    = await fetchFixturesByDate(env, fixtureDate, dbFixture.stage);
-    const match       = fixtures.find((f) => f.id === dbFixture.id);
+    const fixtures = await fetchFixturesPadded(env, fixtureDate, dbFixture.stage);
+    const match = fixtures.find((f) => f.id === dbFixture.id);
     if (!match) return;
+
     if (match.espn_status === ESPN_STATUS.POST) {
-      await updateFixtureStatus(env.DB, dbFixture.id, "FT");
+      const ftStatus = deriveFullTimeStatus(match.espn_status_name);
+      await handleMatchEnd(env, dbFixture, null, match.home_score, match.away_score, ftStatus);
     }
   } catch (err) {
     console.error(`checkIfFinished error for fixture ${dbFixture.id}:`, err);
@@ -670,19 +592,11 @@ async function initGroupStage(env) {
 
   await upsertFixtures(env.DB, all);
 
-  const msg = formatGroupStageSchedule(
-    filtered,
-    FOLLOWED_COUNTRIES !== null,
-    FOLLOWED_COUNTRIES || []
-  );
+  const msg = formatGroupStageSchedule(filtered, FOLLOWED_COUNTRIES !== null, FOLLOWED_COUNTRIES || []);
   await postToGroupMe(env, msg);
   await setState(env.DB, "group_schedule_posted", "1");
   console.log(`Group stage initialized. ${all.length} fixtures stored, ${filtered.length} in schedule post.`);
-  await logEvent(
-    env.DB,
-    "info",
-    `[init] group stage initialized: ${all.length} fixtures stored, ${filtered.length} in schedule post`
-  );
+  await logEvent(env.DB, "info", `[init] group stage initialized: ${all.length} fixtures stored, ${filtered.length} in schedule post`);
 }
 
 // ─── Daily Job (8AM UTC) ──────────────────────────────────────────────────────
@@ -701,7 +615,10 @@ async function runDailyJob(env, force = false) {
   const alreadyPosted = await getState(env.DB, stateKey);
   if (alreadyPosted === "1" && !force) return;
 
-  const raw      = await fetchFixturesByDate(env, tomorrow, "knockout");
+  // Padded fetch: an early-UTC-morning kickoff on "tomorrow" can be bucketed
+  // by ESPN under "today" (see api.js header comment), so an exact-date
+  // fetch for `tomorrow` could miss it and leave it out of the schedule post.
+  const raw = await fetchFixturesPadded(env, tomorrow, "knockout");
   await upsertFixtures(env.DB, raw);
 
   const fixtures = await getFixturesByDate(env.DB, tomorrow);
@@ -713,45 +630,18 @@ async function runDailyJob(env, force = false) {
   await logEvent(env.DB, "info", `[daily] schedule posted for ${tomorrow}: ${fixtures.length} fixture(s)`);
 }
 
-// ─── Chat Commands ────────────────────────────────────────────────────────────
-// Requires the GroupMe bot's "Callback URL" (set in dev.groupme.com) to point
-// at this worker's /groupme-webhook path — see README for setup. Without a
-// callback URL configured, GroupMe never calls this, and the bot behaves
-// exactly as before (posts only, no listening).
-//
-// All command parsing/handling (public commands + the "!admin" tier) lives in
-// commands.js now — this is just the GroupMe-specific entry point that
-// filters out non-user/system callbacks and hands everything else off.
+// ─── GroupMe Webhook ──────────────────────────────────────────────────────────
 
-/**
- * Entry point for GroupMe's message callback. GroupMe posts here for every
- * message sent in the group, including the bot's own — we filter those out
- * to avoid a feedback loop, then hand recognized commands off to commands.js.
- * Unrecognized text is ignored silently so the bot doesn't spam the group
- * in response to ordinary conversation.
- *
- * `body` is the already-parsed JSON payload (or null if parsing failed) —
- * parsed by the caller before responding to GroupMe. See the /groupme-webhook
- * route in fetch() for why parsing happens there rather than in here.
- */
 async function handleGroupMeCallback(env, body) {
-  if (body === null) return; // parse already failed and was logged by the caller
-
-  // Ignore the bot's own posts and any system messages (joins/leaves/etc.)
+  if (body === null) return;
   if (!body || body.sender_type !== "user" || body.system) {
-    await logEvent(
-      env.DB,
-      "debug",
-      `[command] ignored callback: sender_type=${body?.sender_type} system=${body?.system}`
-    );
+    await logEvent(env.DB, "debug", `[command] ignored callback: sender_type=${body?.sender_type} system=${body?.system}`);
     return;
   }
-
   const text = (body.text || "").trim();
   if (!text) return;
 
   await logEvent(env.DB, "debug", `[command] received: "${text}"`);
-
   try {
     const handled = await routeCommand(env, body, JOB_FNS);
     await logEvent(env.DB, "info", `[command] "${text}" -> ${handled ? "handled" : "no match, ignored"}`);
@@ -761,18 +651,15 @@ async function handleGroupMeCallback(env, body) {
   }
 }
 
-
 // ─── Country Filter ───────────────────────────────────────────────────────────
 
 async function filterFixtures(env, fixtures, stage) {
   if (stage === "knockout") return fixtures;
   const staticList = FOLLOWED_COUNTRIES || [];
-  const effective = await getEffectiveFollowedTeams(env, staticList);
+  const effective  = await getEffectiveFollowedTeams(env, staticList);
   if (effective.length === 0) return fixtures;
   const set = new Set(effective.map((c) => c.toLowerCase()));
-  return fixtures.filter(
-    (f) => set.has(f.home.toLowerCase()) || set.has(f.away.toLowerCase())
-  );
+  return fixtures.filter((f) => set.has(f.home.toLowerCase()) || set.has(f.away.toLowerCase()));
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
