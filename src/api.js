@@ -12,6 +12,16 @@
  *
  *   Match summary (full-time stats):
  *     https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event={id}
+ *
+ * IMPORTANT — ESPN date bucketing:
+ *   ESPN's `dates=YYYYMMDD` scoreboard parameter groups matches by ESPN's own
+ *   match-day convention (roughly US-local time), NOT UTC midnight. A match
+ *   stored in our own D1 under UTC date "2026-07-12" (kickoff 01:00 UTC) can
+ *   be completely absent from ESPN's `dates=20260712` response, because ESPN
+ *   still considers it part of July 11's schedule. Any code that needs "the
+ *   fixture(s) for UTC date X" from ESPN should use fetchFixturesPadded()
+ *   below, which pads the request by a day on each side, rather than
+ *   fetchFixturesByDate() with a single exact date.
  */
 
 const SITE_API   = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world";
@@ -30,7 +40,8 @@ export const ESPN_STATUS = {
 // ─── Schedule & Scoreboard ────────────────────────────────────────────────────
 
 /**
- * Fetch all WC 2026 fixtures in a date range. Used once for group stage bulk load.
+ * Fetch all WC 2026 fixtures in a date range. Used once for group stage bulk load,
+ * and internally by fetchFixturesPadded() to dodge ESPN's date-bucketing quirk.
  * ESPN allows a date range in one call: ?dates=YYYYMMDD-YYYYMMDD
  * @returns {Array} normalized fixture objects ready for D1 upsert
  */
@@ -44,6 +55,10 @@ export async function fetchFixturesInRange(_env, fromDate, toDate, stage) {
 
 /**
  * Fetch fixtures for a single date (YYYY-MM-DD).
+ * CAUTION: subject to ESPN's date-bucketing quirk (see file header) — a
+ * fixture near UTC midnight may not appear in the response for the "correct"
+ * UTC date. Prefer fetchFixturesPadded() unless you specifically want ESPN's
+ * own idea of "that day's" schedule (e.g. display purposes only).
  * @returns {Array} normalized fixture objects
  */
 export async function fetchFixturesByDate(_env, date, stage) {
@@ -54,15 +69,45 @@ export async function fetchFixturesByDate(_env, date, stage) {
 }
 
 /**
- * Fetch all currently live WC fixtures from the scoreboard.
- * ESPN's scoreboard returns today's games including live ones.
- * We filter to only "in progress" state.
+ * Fetch fixtures "around" a given UTC date (date-1 to date+1) to dodge ESPN's
+ * date-bucketing convention. Use this instead of fetchFixturesByDate()
+ * whenever the goal is "find fixture(s) that belong to UTC date X" — e.g.
+ * refreshing D1, reconciling a stuck fixture, or looking up tomorrow's slate.
+ * Safe to upsert the full padded result into D1; D1's own kickoff_utc-based
+ * date filtering (getFixturesByDate) will still scope display correctly.
+ * @returns {Array} normalized fixture objects
+ */
+export async function fetchFixturesPadded(env, dateStr, stage, padDays = 1) {
+  const from = addDaysUTC(dateStr, -padDays);
+  const to   = addDaysUTC(dateStr, padDays);
+  return fetchFixturesInRange(env, from, to, stage);
+}
+
+/**
+ * Fetch ALL current scoreboard events (today's slate per ESPN's own bucketing),
+ * regardless of status — pre, in, or post. Unlike fetchLiveFixtures(), this
+ * does NOT filter to in-progress matches, so a fixture that just flipped to
+ * "post" is still visible here. Use this for live polling, where you need to
+ * detect the pre→in and in→post transitions, not just "currently in".
+ * @returns {Array} raw ESPN event objects (not normalized)
+ */
+export async function fetchScoreboardEvents(_env) {
+  const url  = `${SITE_API}/scoreboard`;
+  const data = await espnFetch(url);
+  return data.events || [];
+}
+
+/**
+ * Fetch only currently in-progress WC fixtures from the scoreboard.
+ * Filtered to state === "in" — a fixture that has finished will NOT appear
+ * here. Fine for callers that only care about "is it live right now" (e.g.
+ * chat commands checking current score of an active match), but NOT suitable
+ * for live-polling terminal-state detection — use fetchScoreboardEvents() for that.
  * @returns {Array} raw ESPN event objects (not normalized) for live processing
  */
 export async function fetchLiveFixtures(_env) {
-  const url  = `${SITE_API}/scoreboard`;
-  const data = await espnFetch(url);
-  return (data.events || []).filter(
+  const events = await fetchScoreboardEvents(_env);
+  return events.filter(
     (e) => e.competitions?.[0]?.status?.type?.state === ESPN_STATUS.IN
   );
 }
@@ -99,11 +144,12 @@ export async function fetchStats(_env, fixtureId) {
  * Normalize an ESPN scoreboard event into our D1 fixture shape.
  */
 function normalizeFixture(event, stage) {
-  const comp       = event.competitions?.[0];
-  const home       = comp?.competitors?.find((c) => c.homeAway === "home");
-  const away       = comp?.competitors?.find((c) => c.homeAway === "away");
-  const roundName  = event.season?.slug || comp?.notes?.[0]?.headline || "";
-  const statusState = comp?.status?.type?.state || "pre";
+  const comp        = event.competitions?.[0];
+  const home        = comp?.competitors?.find((c) => c.homeAway === "home");
+  const away        = comp?.competitors?.find((c) => c.homeAway === "away");
+  const roundName   = event.season?.slug || comp?.notes?.[0]?.headline || "";
+  const statusType  = comp?.status?.type;
+  const statusState = statusType?.state || "pre";
 
   return {
     id:          parseInt(event.id, 10),
@@ -113,7 +159,11 @@ function normalizeFixture(event, stage) {
     round:       comp?.notes?.[0]?.headline || roundName,
     stage:       stage || deriveStage(roundName),
     // Pass through ESPN status so index.js can read it
-    espn_status: statusState,
+    espn_status:      statusState,
+    // Raw status name (e.g. "STATUS_FULL_TIME", "STATUS_PENALTY") — needed by
+    // callers (like checkIfFinished's fallback finalization) that only have
+    // normalized fixtures and still need to distinguish FT / AET / PEN.
+    espn_status_name: statusType?.name || "",
     home_score:  parseInt(home?.score || "0", 10),
     away_score:  parseInt(away?.score || "0", 10),
   };
@@ -136,22 +186,23 @@ function toESPNDate(dateStr) {
   return dateStr.replace(/-/g, "");
 }
 
-const MAX_RETRIES   = 2;       // total attempts = MAX_RETRIES + 1
-const BASE_DELAY_MS = 400;     // first retry waits ~400ms, then ~800ms
-const MAX_DELAY_MS  = 3000;    // cap any single wait — cron has a tight budget
+/**
+ * Add N days (positive or negative) to a YYYY-MM-DD UTC date string.
+ */
+function addDaysUTC(dateStr, n) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().split("T")[0];
+}
+
+const MAX_RETRIES   = 2;
+const BASE_DELAY_MS = 400;
+const MAX_DELAY_MS  = 3000;
 
 /**
  * Fetch from ESPN and return parsed JSON.
  * ESPN doesn't require auth headers — plain fetch works from Workers.
- *
- * Retries on transient failures only:
- *   - network errors (fetch throwing, e.g. DNS hiccup, connection reset)
- *   - 5xx server errors
- *   - 429 rate limiting (honors Retry-After header if ESPN sends one)
- * Does NOT retry 4xx errors other than 429 — a 404 or bad request will
- * never succeed on retry, so we fail fast instead of burning the cron's
- * limited time budget (the minute-poll cron has well under 60s before
- * the next invocation fires).
+ * Retries on network errors and 429/5xx with capped exponential backoff.
  */
 async function espnFetch(url) {
   let lastErr;
@@ -166,7 +217,6 @@ async function espnFetch(url) {
         },
       });
     } catch (err) {
-      // Network-level failure (fetch threw) — always retryable
       lastErr = err;
       if (attempt < MAX_RETRIES) {
         await sleep(backoffDelay(attempt));
@@ -184,10 +234,7 @@ async function espnFetch(url) {
 
     const retryAfterHeader = res.headers.get("Retry-After");
     const retryAfterMs = retryAfterHeader ? parseInt(retryAfterHeader, 10) * 1000 : null;
-    const delay = retryAfterMs && !isNaN(retryAfterMs)
-      ? Math.min(retryAfterMs, MAX_DELAY_MS)
-      : backoffDelay(attempt);
-
+    const delay = retryAfterMs && !isNaN(retryAfterMs) ? Math.min(retryAfterMs, MAX_DELAY_MS) : backoffDelay(attempt);
     lastErr = new Error(`ESPN API ${res.status}: ${url}`);
     await sleep(delay);
   }
@@ -200,4 +247,4 @@ function backoffDelay(attempt) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-      }
+    }
